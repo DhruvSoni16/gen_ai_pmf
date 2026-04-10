@@ -1,0 +1,7 @@
+.env
+venv/
+.vscode/
+data/artifacts/
+data/eval_runs/
+vector_db/
+logs/
