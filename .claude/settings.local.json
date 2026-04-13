@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import sacrebleu; print\\('sacrebleu', sacrebleu.__version__\\)\")",
+      "Bash(python -c \"from rouge_score import rouge_scorer; print\\('rouge_score OK'\\)\")",
+      "Bash(python -c \"import bert_score; print\\('bert_score', bert_score.__version__\\)\")",
+      "Bash(python -c \"from sentence_transformers import SentenceTransformer; print\\('sentence_transformers OK'\\)\")",
+      "Bash(pip install:*)",
+      "Bash(python -c \"import sacrebleu\")",
+      "Bash(python -c \"from rouge_score import rouge_scorer\")",
+      "Bash(python -c \"import bert_score\")",
+      "Bash(python -c \"from sentence_transformers import SentenceTransformer\")",
+      "Bash(python -m pip install sacrebleu)",
+      "Bash(python -m ensurepip --upgrade)",
+      "Bash(python -m pip install sacrebleu rouge-score)",
+      "Bash(python -m pip install --user sacrebleu rouge-score)",
+      "Bash(python -m pip install --user bert-score)"
+    ]
+  }
+}

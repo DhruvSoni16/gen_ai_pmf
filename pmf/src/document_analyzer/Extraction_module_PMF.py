@@ -23,6 +23,10 @@ from src.document_retriever.Vector_db import DocumentRetriever
 from src.eval.eval_config import get_eval_rules
 from src.eval.eval_utils import evaluate_run
 from src.eval.eval_store import save_eval_run
+from src.eval.eval_metrics import compute_all_metrics
+from src.eval.eval_judge import PMFJudge
+from src.eval.eval_rag import RAGEvaluator
+from healthark_eval.suite import EvalSuite
 
 
 
@@ -76,23 +80,94 @@ def convert_dict(list):
 
 
 
+def _run_extended_evaluation(run_artifacts, eval_suite):
+    """Run extended LLM-based evaluation on all non-static sections.
+
+    Appends 'extended_eval' to each section dict and sets
+    'extended_eval_summary' on run_artifacts.  Re-saves via save_eval_run().
+    """
+    logging.info("Running extended LLM evaluation...")
+    section_results = []
+
+    for section in run_artifacts.get("sections", []):
+        if section.get("is_static", False):
+            continue
+        generated = section.get("generated_text", "")
+        if not generated.strip():
+            continue
+
+        section_key = section.get("section_key", "")
+        instruction = section.get("prompt_text", "")
+        retrieved_context = ""
+        retrieved_chunks = []
+        for p in section.get("retrieved_paths", []):
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    chunk = f.read()[:4000]
+                    retrieved_chunks.append(chunk)
+                    retrieved_context += chunk + "\n\n"
+            except Exception:
+                pass
+
+        try:
+            result = eval_suite.run(
+                generated=generated,
+                retrieved=retrieved_chunks,
+                reference="",
+                section_key=section_key,
+                section_instruction=instruction,
+                site_name=run_artifacts.get("site_name", ""),
+            )
+            section["extended_eval"] = result.to_dict()
+            section_results.append(result)
+        except Exception as exc:
+            logging.warning("Extended eval failed for '%s': %s", section_key, exc)
+
+    # Document-level summary
+    if section_results:
+        composites = [r.composite_score for r in section_results]
+        mean_composite = round(sum(composites) / len(composites), 2)
+        grades = [r.grade for r in section_results]
+        from collections import Counter
+        grade_dist = dict(Counter(grades))
+    else:
+        mean_composite = 0.0
+        grade_dist = {}
+
+    from healthark_eval.suite import _grade
+    run_artifacts["extended_eval_summary"] = {
+        "mean_composite": mean_composite,
+        "overall_grade": _grade(mean_composite),
+        "sections_evaluated": len(section_results),
+        "grade_distribution": grade_dist,
+    }
+
+    # Re-save with extended eval data
+    rules = get_eval_rules()
+    evaluation = evaluate_run(run_artifacts, rules)
+    save_eval_run(run_artifacts, evaluation)
+    logging.info(
+        "Extended eval complete: composite=%.1f, grade=%s",
+        mean_composite, _grade(mean_composite),
+    )
+
+
 def extraction_pmf(template_file_path):
 
     load_dotenv()
-    AZURE_KEY = os.getenv('AZURE_KEY', 'dcda59d482da43c9b43a07674e41fe89')  # Replace with your actual key or keep it in .env
-    AZURE_ENDPOINT = os.getenv('AZURE_ENDPOINT', 'https://api.geneai.thermofisher.com/dev/gpt4o')
-    AZURE_NAME = os.getenv('AZURE_NAME', 'gpt-4o')
-    AZURE_VERSION = os.getenv('AZURE_VERSION', '2024-05-01-preview')
+    AZURE_KEY = os.getenv('AZURE_KEY', '')
+    AZURE_ENDPOINT = os.getenv('AZURE_ENDPOINT', '')
+    AZURE_NAME = os.getenv('AZURE_NAME', '')
+    AZURE_VERSION = os.getenv('AZURE_VERSION', '')
 
     llm = None
     client = None
     try:
         llm = AzureChatOpenAI(
-            deployment_name=AZURE_NAME,
-            openai_api_key=AZURE_KEY,
-            openai_api_base=AZURE_ENDPOINT,
-            openai_api_version=AZURE_VERSION,
-            openai_api_type="azure",
+            azure_deployment=AZURE_NAME,
+            api_key=AZURE_KEY,
+            azure_endpoint=AZURE_ENDPOINT,
+            api_version=AZURE_VERSION,
             temperature=0.1,
         )
 
@@ -304,6 +379,19 @@ def extraction_pmf(template_file_path):
     eval_file = save_eval_run(run_artifacts, evaluation)
     st.session_state["last_eval_file"] = eval_file
     st.session_state["last_eval_score"] = evaluation.get("document_scores", {}).get("overall_score")
+
+    if st.session_state.get("run_extended_eval", False):
+        eval_suite = EvalSuite(
+            task="pmf",
+            run_judge=True,
+            run_rag=True,
+            run_semantic=False,
+            run_lexical=True,
+        )
+        _run_extended_evaluation(run_artifacts, eval_suite)
+        ext = run_artifacts.get("extended_eval_summary", {})
+        st.session_state["last_extended_composite"] = ext.get("mean_composite", 0)
+        st.session_state["last_extended_grade"] = ext.get("overall_grade", "?")
     
 
    

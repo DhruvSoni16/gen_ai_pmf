@@ -223,59 +223,64 @@ if st.session_state.selected_feature == 'Technical':
    pass
 
 if st.session_state.selected_feature == 'Eval':
-    st.subheader("LLM Evaluation Dashboard")
-    st.write("Review historical PMF generation runs and rule-based scores.")
+    try:
+        from app_eval_dashboard import render_eval_dashboard
+        render_eval_dashboard()
+    except ImportError:
+        # Fallback to basic dashboard if extended dashboard unavailable
+        st.subheader("LLM Evaluation Dashboard")
+        st.write("Review historical PMF generation runs and rule-based scores.")
 
-    runs = list_runs()
-    if not runs:
-        st.info("No evaluation runs found yet. Generate a PMF document first.")
-    else:
-        run_df = pd.DataFrame(runs)
-        st.dataframe(run_df[["timestamp", "site_name", "overall_score", "template_file"]], use_container_width=True)
-
-        run_labels = [
-            f"{row.get('timestamp', '')} | {row.get('site_name', '')} | score={row.get('overall_score', '')}"
-            for row in runs
-        ]
-        selected_idx = st.selectbox("Select a run", options=list(range(len(runs))), format_func=lambda i: run_labels[i])
-        selected_run = runs[selected_idx]
-
-        run_payload = load_run_by_file(selected_run["run_file"])
-        eval_data = run_payload.get("evaluation", {}).get("document_scores", {})
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Overall Score", eval_data.get("overall_score", 0))
-        col2.metric("Section Count", eval_data.get("section_count", 0))
-        col3.metric("Retrieval Coverage (%)", eval_data.get("retrieval_coverage", 0))
-
-        missing = eval_data.get("missing_required_sections", [])
-        if missing:
-            st.warning("Missing required sections: " + ", ".join(missing))
+        runs = list_runs()
+        if not runs:
+            st.info("No evaluation runs found yet. Generate a PMF document first.")
         else:
-            st.success("All required sections present.")
+            run_df = pd.DataFrame(runs)
+            st.dataframe(run_df[["timestamp", "site_name", "overall_score", "template_file"]], use_container_width=True)
 
-        section_rows = eval_data.get("sections", [])
-        if section_rows:
-            section_df = pd.DataFrame(
-                [
-                    {
-                        "section_key": row.get("section_key"),
-                        "score": row.get("score"),
-                        "char_len": row.get("char_len"),
-                        "min_chars": row.get("required_min_chars"),
-                        "missing_keywords": ", ".join(row.get("missing_keywords", [])),
-                        "checks": str(row.get("checks", {})),
-                    }
-                    for row in section_rows
-                ]
-            )
-            st.dataframe(section_df, use_container_width=True)
+            run_labels = [
+                f"{row.get('timestamp', '')} | {row.get('site_name', '')} | score={row.get('overall_score', '')}"
+                for row in runs
+            ]
+            selected_idx = st.selectbox("Select a run", options=list(range(len(runs))), format_func=lambda i: run_labels[i])
+            selected_run = runs[selected_idx]
 
-            st.write("Score Trend")
-            trend_df = run_df[["timestamp", "overall_score"]].copy()
-            trend_df["overall_score"] = pd.to_numeric(trend_df["overall_score"], errors="coerce")
-            trend_df = trend_df.sort_values("timestamp")
-            st.line_chart(trend_df.set_index("timestamp"))
+            run_payload = load_run_by_file(selected_run["run_file"])
+            eval_data = run_payload.get("evaluation", {}).get("document_scores", {})
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Overall Score", eval_data.get("overall_score", 0))
+            col2.metric("Section Count", eval_data.get("section_count", 0))
+            col3.metric("Retrieval Coverage (%)", eval_data.get("retrieval_coverage", 0))
+
+            missing = eval_data.get("missing_required_sections", [])
+            if missing:
+                st.warning("Missing required sections: " + ", ".join(missing))
+            else:
+                st.success("All required sections present.")
+
+            section_rows = eval_data.get("sections", [])
+            if section_rows:
+                section_df = pd.DataFrame(
+                    [
+                        {
+                            "section_key": row.get("section_key"),
+                            "score": row.get("score"),
+                            "char_len": row.get("char_len"),
+                            "min_chars": row.get("required_min_chars"),
+                            "missing_keywords": ", ".join(row.get("missing_keywords", [])),
+                            "checks": str(row.get("checks", {})),
+                        }
+                        for row in section_rows
+                    ]
+                )
+                st.dataframe(section_df, use_container_width=True)
+
+                st.write("Score Trend")
+                trend_df = run_df[["timestamp", "overall_score"]].copy()
+                trend_df["overall_score"] = pd.to_numeric(trend_df["overall_score"], errors="coerce")
+                trend_df = trend_df.sort_values("timestamp")
+                st.line_chart(trend_df.set_index("timestamp"))
 
 if st.session_state.selected_feature =='Plant':
     st.subheader("📄 Plant Master File Generator")
@@ -294,6 +299,11 @@ if st.session_state.selected_feature =='Plant':
         
     
   
+    st.session_state["run_extended_eval"] = st.checkbox(
+        "Run extended LLM evaluation (slower, requires API calls)",
+        value=False,
+    )
+
     st.write("")
     st.write("")
 
@@ -371,8 +381,12 @@ if st.session_state.selected_feature =='Plant':
                         st.write("No text available for download.")
                         st.button("Download", disabled=True)
                     st.markdown(generate_word_download_link(text.getvalue(),final_file_name), unsafe_allow_html=True)
-      
-                    
+
+                    if st.session_state.get("last_extended_composite") is not None:
+                        score = st.session_state["last_extended_composite"]
+                        grade = st.session_state.get("last_extended_grade", "?")
+                        st.success(f"Evaluation complete. Composite score: {score:.1f}/100 (Grade {grade})")
+
                     # shutil.rmtree("Extracted_folder")
                     if 'folder_structure' in st.session_state:
                         del st.session_state['folder_structure']

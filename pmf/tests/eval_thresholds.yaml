@@ -1,0 +1,18 @@
+document_level:
+  min_overall_rule_score: 65.0
+  min_bertscore_f1: 0.75
+  min_judge_normalized_score: 60.0
+  min_faithfulness: 0.70
+  min_context_precision: 0.50
+  min_answer_relevancy: 0.65
+  min_ragas_score: 0.60
+  max_missing_required_sections: 0
+
+section_level:
+  min_rule_score: 40.0
+  min_bertscore_f1: 0.65
+  min_judge_score: 50.0
+  min_faithfulness: 0.60
+
+regression:
+  max_score_drop_vs_baseline: 5.0  # alert if any metric drops > 5 points

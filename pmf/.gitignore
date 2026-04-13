@@ -3,5 +3,12 @@ venv/
 .vscode/
 data/artifacts/
 data/eval_runs/
+data/eval_cache/
+eval_results/
 vector_db/
 logs/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+reports/

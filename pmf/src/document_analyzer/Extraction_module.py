@@ -72,20 +72,19 @@ def convert_dict(list):
 def extraction(template_file_path):
 
     load_dotenv()
-    AZURE_KEY = os.getenv('AZURE_KEY', 'dcda59d482da43c9b43a07674e41fe89')  # Replace with your actual key or keep it in .env
-    AZURE_ENDPOINT = os.getenv('AZURE_ENDPOINT', 'https://api.geneai.thermofisher.com/dev/gpt4o')
-    AZURE_NAME = os.getenv('AZURE_NAME', 'gpt-4o')
-    AZURE_VERSION = os.getenv('AZURE_VERSION', '2024-05-01-preview')
+    AZURE_KEY = os.getenv('AZURE_KEY', '')
+    AZURE_ENDPOINT = os.getenv('AZURE_ENDPOINT', '')
+    AZURE_NAME = os.getenv('AZURE_NAME', '')
+    AZURE_VERSION = os.getenv('AZURE_VERSION', '')
 
     llm = None
     client = None
     try:
         llm = AzureChatOpenAI(
-            deployment_name=AZURE_NAME,
-            openai_api_key=AZURE_KEY,
-            openai_api_base=AZURE_ENDPOINT,
-            openai_api_version=AZURE_VERSION,
-            openai_api_type="azure",
+            azure_deployment=AZURE_NAME,
+            api_key=AZURE_KEY,
+            azure_endpoint=AZURE_ENDPOINT,
+            api_version=AZURE_VERSION,
             temperature=0.1,
         )
 

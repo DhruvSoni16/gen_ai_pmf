@@ -39,9 +39,9 @@ with open('Config/configuration.json', 'r') as f:
 load_dotenv()
 openai.api_key = os.getenv('OPENAI_API_KEY', '')
 AZURE_KEY = os.getenv('AZURE_KEY')
-AZURE_ENDPOINT = os.getenv('AZURE_ENDPOINT', 'https://api.geneai.thermofisher.com/dev/gpt4o')
-AZURE_NAME = os.getenv('AZURE_NAME', 'gpt-4o')
-AZURE_VERSION = os.getenv('AZURE_VERSION', '2024-05-01-preview')
+AZURE_ENDPOINT = os.getenv('AZURE_ENDPOINT', '')
+AZURE_NAME = os.getenv('AZURE_NAME', '')
+AZURE_VERSION = os.getenv('AZURE_VERSION', '')
 
 llm = None
 try:
@@ -194,7 +194,7 @@ def handle_text_agent(llm,client,key, value, doc,flag,index,extract_text,pdf_byt
     messages.append({"role": "user", "content": user_query})
 
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model=AZURE_NAME,
         messages=messages,
         temperature=0.0,
         tools=Text_Extraction_tools  # specify the function call
@@ -432,7 +432,7 @@ def handle_user_message(llm,client,key,value, doc,flag=1,index=1, extract_text="
     messages.extend(conversation_messages)
 
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model=AZURE_NAME,
         messages=messages,
         temperature=0.0,
         tools=triage_tools  # specify the function call
