@@ -29,11 +29,13 @@ except ImportError:
     _sacrebleu = None
     logger.warning("sacrebleu not installed — BLEU metrics will be unavailable.")
 
-try:
-    from rouge_score import rouge_scorer as _rouge_scorer
-except ImportError:
-    _rouge_scorer = None
-    logger.warning("rouge-score not installed — ROUGE metrics will be unavailable.")
+# rouge_score is intentionally NOT imported at module level.
+# rouge_score/rouge_scorer.py does `import nltk` at its top level.
+# langchain_text_splitters also imports nltk eagerly (via NLTKTextSplitter).
+# If both happen in the same import chain, nltk ends up partially initialized,
+# causing: AttributeError: partially initialized module 'nltk' has no attribute 'data'
+# Fix: lazy-import rouge_scorer inside compute_rouge() — by call time nltk is fully loaded.
+_rouge_scorer = None  # populated on first call to compute_rouge()
 
 try:
     import bert_score as _bert_score
@@ -147,8 +149,16 @@ class LexicalMetrics:
         ]
         zero = {k: 0.0 for k in zero_keys}
 
+        # Lazy import to avoid circular nltk initialization (see module-level comment)
+        global _rouge_scorer
         if _rouge_scorer is None:
-            return {**zero, "error": "rouge-score not installed", "value": None}
+            try:
+                from rouge_score import rouge_scorer as _rs
+                _rouge_scorer = _rs
+            except ImportError:
+                logger.warning("rouge-score not installed — ROUGE metrics will be unavailable.")
+                return {**zero, "error": "rouge-score not installed", "value": None}
+
         try:
             if not hypothesis or not hypothesis.strip() or not reference or not reference.strip():
                 return zero

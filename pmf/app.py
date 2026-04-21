@@ -294,16 +294,10 @@ if st.session_state.selected_feature =='Plant':
 
     st.session_state.SiteName = st.text_input("Enter the site name", value="")
 
-    # template_doc= r"templates\PMF_Template_With_vector_DB.docx"
-    template_doc=rf"templates\template_1 - Copy.docx"
+    template_doc = r"templates\PMF_Template_With_vector_DB-Copy.docx"
         
     
   
-    st.session_state["run_extended_eval"] = st.checkbox(
-        "Run extended LLM evaluation (slower, requires API calls)",
-        value=False,
-    )
-
     st.write("")
     st.write("")
 
@@ -382,10 +376,52 @@ if st.session_state.selected_feature =='Plant':
                         st.button("Download", disabled=True)
                     st.markdown(generate_word_download_link(text.getvalue(),final_file_name), unsafe_allow_html=True)
 
-                    if st.session_state.get("last_extended_composite") is not None:
-                        score = st.session_state["last_extended_composite"]
-                        grade = st.session_state.get("last_extended_grade", "?")
-                        st.success(f"Evaluation complete. Composite score: {score:.1f}/100 (Grade {grade})")
+                    # ── Evaluation summary ──────────────────────────────────────
+                    _rule_score = st.session_state.get("last_eval_score")
+                    _ext_composite = st.session_state.get("last_extended_composite")
+                    _ext_judge = st.session_state.get("last_extended_judge")
+                    _ext_rag = st.session_state.get("last_extended_rag")
+                    _ext_grade = st.session_state.get("last_extended_grade")
+                    _mlflow_run_id = st.session_state.get("last_mlflow_run_id")
+                    _mlflow_url = st.session_state.get("last_mlflow_url", "http://localhost:5000")
+
+                    # Use composite from extended eval if available, else rule score
+                    _display_score = float(_ext_composite) if _ext_composite is not None else (float(_rule_score) if _rule_score is not None else 0.0)
+                    _display_grade = _ext_grade if _ext_grade else ("A" if _display_score >= 90 else "B" if _display_score >= 75 else "C" if _display_score >= 60 else "D" if _display_score >= 45 else "F")
+                    _grade_clr = "#1D9E75" if _display_score >= 75 else "#BA7517" if _display_score >= 60 else "#D85A30"
+                    _health = "Good Quality" if _display_score >= 75 else "Acceptable" if _display_score >= 60 else "Needs Improvement"
+
+                    _judge_str = f"{float(_ext_judge):.1f}/100" if _ext_judge is not None else "computing..."
+                    _rag_str = f"{float(_ext_rag):.3f}" if _ext_rag is not None else "computing..."
+                    _rule_str = f"{float(_rule_score):.1f}/100" if _rule_score is not None else "—"
+
+                    _mlflow_line = ""
+                    if _mlflow_run_id:
+                        _mlflow_line = (
+                            f'<br><span style="font-size:0.82rem;">'
+                            f'📊 <a href="{_mlflow_url}" target="_blank" style="color:#5340C0;">'
+                            f'View in MLflow UI</a> &nbsp;'
+                            f'<span style="color:#9ca3af;">(run: {_mlflow_run_id[:8]}…)</span>'
+                            f'</span>'
+                        )
+
+                    st.markdown(
+                        f'<div style="background:{_grade_clr}22;border-left:4px solid {_grade_clr};'
+                        f'padding:14px 18px;border-radius:8px;margin:16px 0;">'
+                        f'<span style="font-size:1.1rem;font-weight:700;color:{_grade_clr};">'
+                        f'Grade {_display_grade} — {_health} &nbsp;({_display_score:.1f}/100)</span><br><br>'
+                        f'<span style="color:#374151;font-size:0.9rem;">'
+                        f'Rule Score: <strong>{_rule_str}</strong> &nbsp;|&nbsp; '
+                        f'Judge Score: <strong>{_judge_str}</strong> &nbsp;|&nbsp; '
+                        f'RAG Triad: <strong>{_rag_str}</strong>'
+                        f'</span><br>'
+                        f'<span style="color:#6b7280;font-size:0.82rem;">'
+                        f'Open the <strong>Evaluation Dashboard</strong> in the sidebar for full DeepEval + Opik metrics.'
+                        f'</span>'
+                        f'{_mlflow_line}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
 
                     # shutil.rmtree("Extracted_folder")
                     if 'folder_structure' in st.session_state:

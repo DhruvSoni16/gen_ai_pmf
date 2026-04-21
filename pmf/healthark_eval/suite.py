@@ -118,10 +118,10 @@ class DocumentEvalResult:
 # ═══════════════════════════════════════════════════════════════════════════
 
 _COMPOSITE_WEIGHTS = {
-    "rule": 0.15,
-    "bertscore_f1": 0.20,
-    "judge_normalized": 0.40,
-    "ragas_score": 0.25,
+    "rule": 0.20,
+    "judge_normalized": 0.55,
+    "rag_triad_score": 0.25,
+    # bertscore_f1 excluded — torch DLL issue on this Windows environment
 }
 
 
@@ -212,11 +212,13 @@ class EvalSuite:
     def __init__(
         self,
         task: str = "pmf",
-        llm_provider: str = "anthropic",
-        llm_model: str = "claude-sonnet-4-6",
+        llm_provider: str = "azure_openai",
+        llm_model: str = "gpt-4o",
         api_key: Optional[str] = None,
-        run_lexical: bool = True,
-        run_semantic: bool = True,
+        azure_endpoint: Optional[str] = None,
+        azure_api_version: Optional[str] = None,
+        run_lexical: bool = False,
+        run_semantic: bool = False,
         run_judge: bool = True,
         run_rag: bool = True,
         output_dir: str = "eval_results",
@@ -228,6 +230,8 @@ class EvalSuite:
         self.llm_provider = llm_provider
         self.llm_model = llm_model
         self.api_key = api_key
+        self.azure_endpoint = azure_endpoint or os.environ.get("AZURE_ENDPOINT", os.environ.get("AZURE_OPENAI_ENDPOINT", ""))
+        self.azure_api_version = azure_api_version or os.environ.get("AZURE_VERSION", os.environ.get("AZURE_OPENAI_API_VERSION", "2024-06-01"))
         self.run_lexical = run_lexical
         self.run_semantic = run_semantic
         self.run_judge = run_judge
@@ -269,13 +273,15 @@ class EvalSuite:
         return self._semantic
 
     def _get_judge(self) -> Any:
-        """Lazy-load PMFJudge instance."""
+        """Lazy-load PMFJudge instance with Azure OpenAI credentials."""
         if self._judge is None:
             from src.eval.eval_judge import PMFJudge
             self._judge = PMFJudge(
                 provider=self.llm_provider,
                 model=self.llm_model,
                 api_key=self.api_key,
+                azure_endpoint=self.azure_endpoint,
+                azure_api_version=self.azure_api_version,
             )
         return self._judge
 
@@ -399,15 +405,9 @@ class EvalSuite:
         # --- composite ---
         composite_inputs: Dict[str, Optional[float]] = {
             "rule": rule_score,
-            "bertscore_f1": None,
             "judge_normalized": None,
-            "ragas_score": None,
+            "rag_triad_score": None,
         }
-
-        if semantic_scores:
-            f1 = semantic_scores.get("bertscore_f1_mean")
-            if f1 is not None:
-                composite_inputs["bertscore_f1"] = f1 * 100.0
 
         if judge_scores and not judge_scores.get("judge_error"):
             ns = judge_scores.get("normalized_score")
@@ -415,9 +415,10 @@ class EvalSuite:
                 composite_inputs["judge_normalized"] = float(ns)
 
         if rag_scores:
-            rs = rag_scores.get("ragas_score")
+            # Support both new name (rag_triad_score) and legacy (ragas_score)
+            rs = rag_scores.get("rag_triad_score") or rag_scores.get("ragas_score")
             if rs is not None:
-                composite_inputs["ragas_score"] = float(rs) * 100.0
+                composite_inputs["rag_triad_score"] = float(rs) * 100.0
 
         composite = _compute_composite(composite_inputs)
         g = _grade(composite)
@@ -512,20 +513,16 @@ class EvalSuite:
                         if f1 is not None:
                             ci: Dict[str, Optional[float]] = {
                                 "rule": results[idx].rule_score,
-                                "bertscore_f1": float(f1) * 100.0,
                                 "judge_normalized": None,
-                                "ragas_score": None,
+                                "rag_triad_score": None,
                             }
                             js = results[idx].judge_scores
                             if js and not js.get("judge_error"):
                                 ci["judge_normalized"] = js.get("normalized_score")
                             rs = results[idx].rag_scores
                             if rs:
-                                ci["ragas_score"] = (
-                                    float(rs["ragas_score"]) * 100.0
-                                    if rs.get("ragas_score") is not None
-                                    else None
-                                )
+                                _rs = rs.get("rag_triad_score") or rs.get("ragas_score")
+                                ci["rag_triad_score"] = float(_rs) * 100.0 if _rs is not None else None
                             new_comp = _compute_composite(ci)
                             results[idx].composite_score = new_comp
                             results[idx].grade = _grade(new_comp)

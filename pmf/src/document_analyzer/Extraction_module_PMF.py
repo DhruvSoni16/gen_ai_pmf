@@ -1,7 +1,8 @@
 import io
 import os
 import re
-import shutil 
+import shutil
+import time
 import logging
 from docx import Document
 import json
@@ -28,6 +29,21 @@ from src.eval.eval_judge import PMFJudge
 from src.eval.eval_rag import RAGEvaluator
 from healthark_eval.suite import EvalSuite
 
+
+
+def _derive_section_title(key: str, value: str) -> str:
+    """Extract a human-readable section title from a template value.
+
+    Template sections have a type prefix as the key (e.g. "Text: -",
+    "Static_text:-") while the actual section heading is the first
+    meaningful line of the value (e.g. "1.0 GENERAL INFORMATION:").
+    This is used to produce meaningful section keys for the eval dashboard.
+    """
+    for line in (value or "").split("\n"):
+        clean = line.strip().replace("**", "").replace("*", "").strip()
+        if clean and len(clean) > 3:
+            return clean.rstrip(":").strip()[:70]
+    return key  # fallback to the type key if value is empty
 
 
 # Function to split the template text into two parts based on the section header
@@ -81,13 +97,34 @@ def convert_dict(list):
 
 
 def _run_extended_evaluation(run_artifacts, eval_suite):
-    """Run extended LLM-based evaluation on all non-static sections.
+    """Run extended evaluation: DeepEval RAG Triad + Opik-style + MLflow logging.
 
-    Appends 'extended_eval' to each section dict and sets
-    'extended_eval_summary' on run_artifacts.  Re-saves via save_eval_run().
+    Per section: appends 'extended_eval' (DeepEval results) and
+    'opik_eval' (hallucination / answer_relevance / regulatory_tone).
+    Document level: saves 'extended_eval_summary' and logs to MLflow.
     """
-    logging.info("Running extended LLM evaluation...")
+    from src.eval.eval_opik_style import OpikStyleScorer
+    from src.eval.eval_mlflow_tracker import MLflowTracker
+    from openai import AzureOpenAI
+
+    logging.info("Running extended evaluation (DeepEval + Opik-style + MLflow)...")
+
+    # Build shared Azure client for Opik scorer
+    _azure_key = run_artifacts.get("_azure_key", "")
+    _azure_ep = run_artifacts.get("_azure_endpoint", "")
+    _azure_ver = run_artifacts.get("_azure_version", "2024-06-01")
+    _azure_name = run_artifacts.get("model_name", "gpt-4o")
+
+    opik_scorer = None
+    try:
+        if _azure_key and _azure_ep:
+            _client = AzureOpenAI(api_key=_azure_key, api_version=_azure_ver, azure_endpoint=_azure_ep)
+            opik_scorer = OpikStyleScorer(llm_client=_client, model=_azure_name)
+    except Exception as exc:
+        logging.warning("Opik scorer init failed: %s", exc)
+
     section_results = []
+    _eval_phase_start = time.perf_counter()
 
     for section in run_artifacts.get("sections", []):
         if section.get("is_static", False):
@@ -98,17 +135,19 @@ def _run_extended_evaluation(run_artifacts, eval_suite):
 
         section_key = section.get("section_key", "")
         instruction = section.get("prompt_text", "")
-        retrieved_context = ""
         retrieved_chunks = []
         for p in section.get("retrieved_paths", []):
             try:
                 with open(p, "r", encoding="utf-8", errors="ignore") as f:
                     chunk = f.read()[:4000]
                     retrieved_chunks.append(chunk)
-                    retrieved_context += chunk + "\n\n"
             except Exception:
                 pass
 
+        merged_context = "\n\n".join(retrieved_chunks)
+        _sec_eval_start = time.perf_counter()
+
+        # ── DeepEval (Judge + RAG Triad) ─────────────────────────────
         try:
             result = eval_suite.run(
                 generated=generated,
@@ -121,34 +160,136 @@ def _run_extended_evaluation(run_artifacts, eval_suite):
             section["extended_eval"] = result.to_dict()
             section_results.append(result)
         except Exception as exc:
-            logging.warning("Extended eval failed for '%s': %s", section_key, exc)
+            logging.warning("DeepEval failed for '%s': %s", section_key, exc)
 
-    # Document-level summary
+        # ── Opik-style (Hallucination + Answer Relevance + Regulatory Tone) ──
+        if opik_scorer:
+            try:
+                opik_result = opik_scorer.evaluate_section(
+                    section_key=section_key,
+                    output=generated,
+                    context=merged_context,
+                    instruction=instruction,
+                )
+                section["opik_eval"] = opik_result
+            except Exception as exc:
+                logging.warning("Opik scoring failed for '%s': %s", section_key, exc)
+
+        # Store eval timing back into the section's timing dict
+        _sec_eval_ms = round((time.perf_counter() - _sec_eval_start) * 1000, 1)
+        if "timing" not in section or section["timing"] is None:
+            section["timing"] = {}
+        section["timing"]["eval_ms"] = _sec_eval_ms
+        section["timing"]["total_ms"] = round(
+            (section["timing"].get("retrieval_ms") or 0)
+            + (section["timing"].get("generation_ms") or 0)
+            + _sec_eval_ms,
+            1,
+        )
+
+    # ── Document-level aggregation ────────────────────────────────────
+    from collections import Counter
+    from healthark_eval.suite import _grade
+
+    def _mean(vals):
+        clean = [float(v) for v in vals if v is not None]
+        return round(sum(clean) / len(clean), 4) if clean else None
+
     if section_results:
         composites = [r.composite_score for r in section_results]
         mean_composite = round(sum(composites) / len(composites), 2)
-        grades = [r.grade for r in section_results]
-        from collections import Counter
-        grade_dist = dict(Counter(grades))
-    else:
-        mean_composite = 0.0
-        grade_dist = {}
+        grade_dist = dict(Counter(r.grade for r in section_results))
 
-    from healthark_eval.suite import _grade
+        mean_judge = _mean([
+            r.judge_scores.get("normalized_score")
+            for r in section_results
+            if r.judge_scores and not r.judge_scores.get("judge_error")
+        ])
+        mean_rag = _mean([
+            r.rag_scores.get("rag_triad_score") or r.rag_scores.get("ragas_score")
+            for r in section_results if r.rag_scores
+        ])
+        mean_faith = _mean([
+            r.rag_scores.get("faithfulness")
+            for r in section_results if r.rag_scores
+        ])
+    else:
+        mean_composite, grade_dist = 0.0, {}
+        mean_judge = mean_rag = mean_faith = None
+
+    # Opik document-level aggregation
+    opik_sections = [s.get("opik_eval", {}) for s in run_artifacts.get("sections", []) if s.get("opik_eval")]
+    mean_hallucination = _mean([s.get("hallucination_score") for s in opik_sections])
+    mean_answer_rel = _mean([s.get("answer_relevance_score") for s in opik_sections])
+    mean_reg_tone = _mean([s.get("regulatory_tone_score") for s in opik_sections])
+    mean_opik_composite = _mean([s.get("opik_composite") for s in opik_sections])
+
     run_artifacts["extended_eval_summary"] = {
         "mean_composite": mean_composite,
         "overall_grade": _grade(mean_composite),
         "sections_evaluated": len(section_results),
         "grade_distribution": grade_dist,
+        # DeepEval metrics
+        "mean_judge_normalized": mean_judge,
+        "mean_rag_triad_score": mean_rag,
+        "mean_faithfulness": mean_faith,
+        "mean_bertscore_f1": None,
+        # Opik-style metrics
+        "mean_hallucination_score": mean_hallucination,
+        "mean_answer_relevance_score": mean_answer_rel,
+        "mean_regulatory_tone_score": mean_reg_tone,
+        "mean_opik_composite": mean_opik_composite,
+        # Backwards-compat
+        "mean_ragas": mean_rag,
+        "framework": "deepeval_rag_triad + opik_style",
     }
 
-    # Re-save with extended eval data
+    # ── Finalise overall pipeline timing ─────────────────────────────
+    _total_eval_ms = round((time.perf_counter() - _eval_phase_start) * 1000, 1)
+    if "timing" in run_artifacts and run_artifacts["timing"] is not None:
+        run_artifacts["timing"]["total_eval_ms"] = _total_eval_ms
+        gen_phase = run_artifacts["timing"].get("generation_phase_ms") or 0
+        run_artifacts["timing"]["total_pipeline_ms"] = round(gen_phase + _total_eval_ms, 1)
+
+    # Re-save with all extended eval data
     rules = get_eval_rules()
     evaluation = evaluate_run(run_artifacts, rules)
     save_eval_run(run_artifacts, evaluation)
+
+    # ── Performance analysis (latency + failures + improvements) ─────
+    try:
+        from src.eval.eval_performance import PerformanceAnalyzer
+        perf_report = PerformanceAnalyzer().analyze(run_artifacts, evaluation)
+        run_artifacts["performance_report"] = perf_report.to_dict()
+        logging.info(
+            "Performance: %s | failures=%d | improvements=%d",
+            perf_report.summary_technical[:120],
+            len(perf_report.failures),
+            len(perf_report.improvements),
+        )
+    except Exception as exc:
+        logging.warning("Performance analysis failed: %s", exc)
+
+    # ── MLflow tracking ───────────────────────────────────────────────
+    try:
+        tracker = MLflowTracker()
+        mlflow_run_id = tracker.log_run(
+            run_artifacts=run_artifacts,
+            eval_summary=evaluation,
+            extended_summary=run_artifacts["extended_eval_summary"],
+        )
+        run_artifacts["mlflow_run_id"] = mlflow_run_id
+        run_artifacts["mlflow_ui_url"] = tracker.run_url(mlflow_run_id)
+        logging.info("MLflow run logged: %s", mlflow_run_id)
+    except Exception as exc:
+        logging.warning("MLflow logging failed: %s", exc)
+
     logging.info(
-        "Extended eval complete: composite=%.1f, grade=%s",
+        "Evaluation complete — composite=%.1f grade=%s | judge=%.1f | "
+        "rag_triad=%.3f | hallucination=%.3f | reg_tone=%.3f",
         mean_composite, _grade(mean_composite),
+        mean_judge or 0.0, mean_rag or 0.0,
+        mean_hallucination or 0.0, mean_reg_tone or 0.0,
     )
 
 
@@ -250,6 +391,7 @@ def extraction_pmf(template_file_path):
     retriever.process_documents()
     
     st.write("Extracting text from documents...")
+    _pipeline_start = time.perf_counter()
 
 
     # Check if the uploaded file is a CSV or Excel file and read it into a DataFrame
@@ -279,14 +421,19 @@ def extraction_pmf(template_file_path):
         st.write("")
 
         section_json={key:value}
-        try:    
+        _sec_start = time.perf_counter()
+        _ret_ms = None
+        _gen_ms = None
+        try:
 
             input_file_text=""
             paths = []
             # Retrive the documents name from the vector database
             if len(value_ls)>1:
                 st.write(value_ls[1])
+                _ret_t0 = time.perf_counter()
                 results = retriever.search(value_ls[1], top_k=5)
+                _ret_ms = (time.perf_counter() - _ret_t0) * 1000
 
                 for i, (path, filename, score) in enumerate(results):
                     paths.append(path)
@@ -307,18 +454,23 @@ def extraction_pmf(template_file_path):
             
 
             # try:   
-            if "static" not in key.lower(): 
-
-
-                    response_data = handle_user_message(llm,client,key,value_ls[0],doc_1,flag,index,input_file_text,input_file_path)
-                
+            if "static" not in key.lower():
+                _gen_t0 = time.perf_counter()
+                response_data = handle_user_message(llm,client,key,value_ls[0],doc_1,flag,index,input_file_text,input_file_path)
+                _gen_ms = (time.perf_counter() - _gen_t0) * 1000
             else:
-                # pass
-                response_data = handle_user_message(llm,client,key,value_ls[0],doc_1,flag,index)  
+                _gen_t0 = time.perf_counter()
+                response_data = handle_user_message(llm,client,key,value_ls[0],doc_1,flag,index)
+                _gen_ms = (time.perf_counter() - _gen_t0) * 1000
+
+            # Use a meaningful title derived from the section value instead of
+            # the template type-prefix key ("Text: -", "Static_text:-", etc.)
+            display_key = _derive_section_title(key, value_ls[0] if value_ls else value)
 
             run_artifacts["sections"].append(
                 {
-                    "section_key": key,
+                    "section_key": display_key,
+                    "template_key": key,          # original type prefix kept for debugging
                     "prompt_text": value_ls[0] if len(value_ls) > 0 else "",
                     "retrieval_query": value_ls[1] if len(value_ls) > 1 else "",
                     "retrieved_paths": paths,
@@ -326,11 +478,36 @@ def extraction_pmf(template_file_path):
                     "is_static": "static" in key.lower(),
                     "agent_result": response_data,
                     "generated_text": (response_data or {}).get("result", {}).get("generated_text", ""),
+                    "timing": {
+                        "retrieval_ms": round(_ret_ms, 1) if _ret_ms is not None else None,
+                        "generation_ms": round(_gen_ms, 1) if _gen_ms is not None else None,
+                        "eval_ms": None,
+                        "total_ms": round((time.perf_counter() - _sec_start) * 1000, 1),
+                    },
                 }
             )
         except Exception as e:
             st.write("Error in processing the section:")
             st.write(f"An error occurred: {e}")
+            _sec_err_ms = round((time.perf_counter() - _sec_start) * 1000, 1)
+            run_artifacts["sections"].append({
+                "section_key": _derive_section_title(key, value_ls[0] if value_ls else value),
+                "template_key": key,
+                "prompt_text": value_ls[0] if len(value_ls) > 0 else "",
+                "retrieval_query": value_ls[1] if len(value_ls) > 1 else "",
+                "retrieved_paths": [],
+                "input_text_size": 0,
+                "is_static": "static" in key.lower(),
+                "agent_result": None,
+                "generated_text": "",
+                "generation_error": str(e),
+                "timing": {
+                    "retrieval_ms": round(_ret_ms, 1) if _ret_ms is not None else None,
+                    "generation_ms": round(_gen_ms, 1) if _gen_ms is not None else None,
+                    "eval_ms": None,
+                    "total_ms": _sec_err_ms,
+                },
+            })
             continue
                 
            
@@ -339,6 +516,22 @@ def extraction_pmf(template_file_path):
          
 
    
+
+    # Store overall pipeline timing (generation phase only; eval_ms added later)
+    _generation_phase_ms = round((time.perf_counter() - _pipeline_start) * 1000, 1)
+    run_artifacts["timing"] = {
+        "generation_phase_ms": _generation_phase_ms,
+        "total_pipeline_ms": None,   # updated after eval completes
+        "total_generation_ms": round(sum(
+            (s.get("timing") or {}).get("generation_ms") or 0
+            for s in run_artifacts["sections"]
+        ), 1),
+        "total_retrieval_ms": round(sum(
+            (s.get("timing") or {}).get("retrieval_ms") or 0
+            for s in run_artifacts["sections"]
+        ), 1),
+        "total_eval_ms": None,       # filled by _run_extended_evaluation
+    }
 
     # Save the document to a new file----------------------------------------------------------------------------------------------------
     new_file_path = fr"data/artifacts/generated output file\\{new_file_name}" 
@@ -380,18 +573,34 @@ def extraction_pmf(template_file_path):
     st.session_state["last_eval_file"] = eval_file
     st.session_state["last_eval_score"] = evaluation.get("document_scores", {}).get("overall_score")
 
-    if st.session_state.get("run_extended_eval", False):
+    # Always run extended evaluation using the Azure credentials already in .env.
+    # No checkbox needed — Judge + DeepEval RAG Triad run automatically after generation.
+    try:
         eval_suite = EvalSuite(
             task="pmf",
+            llm_provider="azure_openai",
+            llm_model=AZURE_NAME,
+            api_key=AZURE_KEY,
+            azure_endpoint=AZURE_ENDPOINT,
+            azure_api_version=AZURE_VERSION,
             run_judge=True,
             run_rag=True,
-            run_semantic=False,
-            run_lexical=True,
+            run_semantic=False,   # BERTScore skipped — torch DLL issue on Windows
+            run_lexical=False,    # No reference text available during generation
         )
+        run_artifacts["_azure_key"] = AZURE_KEY
+        run_artifacts["_azure_endpoint"] = AZURE_ENDPOINT
+        run_artifacts["_azure_version"] = AZURE_VERSION
         _run_extended_evaluation(run_artifacts, eval_suite)
         ext = run_artifacts.get("extended_eval_summary", {})
         st.session_state["last_extended_composite"] = ext.get("mean_composite", 0)
         st.session_state["last_extended_grade"] = ext.get("overall_grade", "?")
+        st.session_state["last_extended_judge"] = ext.get("mean_judge_normalized")
+        st.session_state["last_extended_rag"] = ext.get("mean_rag_triad_score")
+        st.session_state["last_mlflow_run_id"] = run_artifacts.get("mlflow_run_id")
+        st.session_state["last_mlflow_url"] = run_artifacts.get("mlflow_ui_url", "http://localhost:5000")
+    except Exception as _ext_exc:
+        logging.warning("Extended evaluation failed: %s", _ext_exc)
     
 
    

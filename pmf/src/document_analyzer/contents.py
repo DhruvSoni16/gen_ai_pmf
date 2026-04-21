@@ -200,6 +200,7 @@ def extract_headings_with_tables(input_path, flag=1, output_path=None):
 
 def refresh_toc_with_word(doc_path):
     """Refresh TOC using Microsoft Word COM."""
+    word = None
     pythoncom.CoInitialize()
     
     try:
@@ -221,7 +222,11 @@ def refresh_toc_with_word(doc_path):
     except Exception as e:
         print(f"❌ Error updating TOC: {e}")
     finally:
-        word.Quit()
+        if word is not None:
+            try:
+                word.Quit()
+            except Exception as quit_error:
+                print(f"[WARN] Error quitting Word: {quit_error}")
         pythoncom.CoUninitialize()
 
 # Example usage

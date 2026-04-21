@@ -53,11 +53,23 @@ try:
 except ImportError:
     HAS_PLOTLY = False
 
+# Lexical metrics (BLEU/ROUGE) — sacrebleu + rouge-score, no torch dependency
 try:
-    from src.eval.eval_metrics import LexicalMetrics, SemanticMetrics, compute_all_metrics
-    HAS_METRICS = True
+    from src.eval.eval_metrics import LexicalMetrics
+    HAS_LEXICAL = True
 except (ImportError, OSError):
-    HAS_METRICS = False
+    HAS_LEXICAL = False
+    logger.warning("LexicalMetrics unavailable — BLEU/ROUGE disabled")
+
+# Semantic metrics (BERTScore) — bert-score + sentence-transformers, needs torch
+try:
+    from src.eval.eval_metrics import SemanticMetrics, compute_all_metrics
+    HAS_SEMANTIC = True
+except (ImportError, OSError):
+    HAS_SEMANTIC = False
+    logger.warning("SemanticMetrics unavailable — BERTScore disabled")
+
+HAS_METRICS = HAS_LEXICAL or HAS_SEMANTIC
 
 try:
     from src.eval.benchmark_loader import BenchmarkLoader
@@ -215,22 +227,43 @@ def _render_sidebar() -> None:
         st.markdown(f"<h3 style='color:{CLR_PRIMARY};'>Settings</h3>",
                     unsafe_allow_html=True)
 
-        st.text_input("Anthropic API Key", type="password",
-                       key="sidebar_anthropic_key",
-                       help="Used for LLM-as-Judge and RAG evaluation")
-        st.text_input("Azure OpenAI API Key", type="password",
-                       key="sidebar_azure_key",
-                       help="Used for Azure OpenAI-based evaluation")
+        # Pre-fill keys from .env so the user doesn't have to retype them
+        _default_anthropic = os.getenv("ANTHROPIC_API_KEY", "")
+        _default_azure = os.getenv("AZURE_KEY", os.getenv("AZURE_OPENAI_API_KEY", ""))
+
+        st.text_input(
+            "Anthropic API Key",
+            value=_default_anthropic,
+            type="password",
+            key="sidebar_anthropic_key",
+            help="Used for LLM-as-Judge. Auto-loaded from .env if ANTHROPIC_API_KEY is set.",
+        )
+        st.text_input(
+            "Azure OpenAI API Key",
+            value=_default_azure,
+            type="password",
+            key="sidebar_azure_key",
+            help="Auto-loaded from .env (AZURE_KEY).",
+        )
 
         st.selectbox("Judge Model", [
             "claude-sonnet-4-6", "gpt-4o",
         ], key="sidebar_judge_model")
 
-        st.markdown("**Metric Toggles**")
-        st.checkbox("Run Lexical (BLEU/ROUGE)", value=True, key="toggle_lexical")
-        st.checkbox("Run Semantic (BERTScore)", value=False, key="toggle_semantic")
-        st.checkbox("Run LLM Judge", value=False, key="toggle_judge")
-        st.checkbox("Run RAG Metrics", value=False, key="toggle_rag")
+        st.markdown("**Quick Eval Toggles** *(for the text box below)*")
+        st.checkbox(
+            "Run LLM Judge",
+            value=False,
+            key="toggle_judge",
+            help="Calls an LLM to score the pasted text on 5 PMF criteria (needs API key above).",
+        )
+        st.checkbox(
+            "Run DeepEval RAG Triad",
+            value=False,
+            key="toggle_rag",
+            help="Faithfulness + Contextual Precision + Answer Relevancy (DeepEval methodology, needs LLM API key).",
+        )
+        st.info("Judge + RAG Triad run **automatically** after every document generation — no checkbox needed there.")
 
         st.divider()
 
@@ -254,16 +287,25 @@ def _render_tab_overview(runs: List[Dict[str, Any]]) -> None:
 
     # ── Run selector ─────────────────────────────────────────────────────
     if not runs:
-        st.info("No evaluation runs found. Generate a PMF document first.")
+        st.info(
+            "No evaluation runs found yet. "
+            "Generate a PMF document using the **Plant Master File** option in the sidebar."
+        )
         return
 
+    # Auto-select the latest run (index 0 — list is sorted newest first)
     labels = [
         f"{r.get('timestamp', '')}  |  {r.get('site_name', '')}  |  "
         f"score={r.get('overall_score', '?')}"
         for r in runs
     ]
-    idx = st.selectbox("Select evaluation run", range(len(runs)),
-                       format_func=lambda i: labels[i], key="tab1_run_sel")
+    idx = st.selectbox(
+        "Evaluation run",
+        range(len(runs)),
+        format_func=lambda i: labels[i],
+        key="tab1_run_sel",
+        help="Auto-selected: most recent run. Change to compare older runs.",
+    )
     run_meta = runs[idx]
     run_file = run_meta.get("run_file", "")
     if not run_file or not os.path.exists(run_file):
@@ -296,32 +338,163 @@ def _render_tab_overview(runs: List[Dict[str, Any]]) -> None:
 
     bert_f1 = ext.get("mean_bertscore_f1")
     judge_score = ext.get("mean_judge_normalized")
-    ragas_score = ext.get("mean_ragas")
+    rag_triad = ext.get("mean_rag_triad_score") or ext.get("mean_ragas")
+    mean_faith = ext.get("mean_faithfulness")
     composite = ext.get("mean_composite", rule_score)
+
+    # ── Smart health summary (plain-English) ─────────────────────────────
+    _grade_val = _letter_grade(float(composite or rule_score or 0))
+    _passed = float(composite or rule_score or 0) >= 65.0
+    _site = run_meta.get("site_name", "")
+    _sec_count = eval_data.get("section_count", 0)
+    _missing = eval_data.get("missing_required_sections", [])
+    _retrieval = eval_data.get("retrieval_coverage", 100)
+    _sections = eval_data.get("sections", [])
+    _worst = sorted(_sections, key=lambda s: s.get("score", 100))[:3]
+
+    # Colour band
+    _health_clr = CLR_SUCCESS if _passed else CLR_DANGER
+    _health_label = "Good Quality" if _grade_val in ("A", "B") else (
+        "Acceptable" if _grade_val == "C" else "Needs Improvement"
+    )
+    st.markdown(
+        f'<div style="background:{_health_clr}22;border-left:4px solid {_health_clr};'
+        f'padding:12px 16px;border-radius:6px;margin-bottom:16px;">'
+        f'<span style="font-size:1.1rem;font-weight:700;color:{_health_clr};">'
+        f'{_grade_badge_html(_grade_val)} &nbsp; {_health_label}</span><br>'
+        f'<span style="color:#374151;">'
+        f'Document for <strong>{_site or "unknown site"}</strong> — '
+        f'{_sec_count} sections evaluated, '
+        f'{_retrieval:.0f}% retrieval coverage'
+        + (f', <strong style="color:{CLR_DANGER};">{len(_missing)} missing required sections</strong>' if _missing else '')
+        + f'</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    if _worst:
+        _low_names = [s.get("section_key", "?")[:40] for s in _worst if s.get("score", 100) < 75]
+        if _low_names:
+            st.warning(
+                f"Sections needing attention: **{', '.join(_low_names)}** — "
+                "see Section Heatmap tab for details."
+            )
 
     # ── Metric cards ─────────────────────────────────────────────────────
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Rule Score", _fmt(rule_score),
-              delta=_fmt(_delta(rule_score, prev_rule)))
-    c2.metric("BERTScore F1", _fmt(bert_f1, 4))
-    c3.metric("Judge Score", _fmt(judge_score))
-    c4.metric("RAGAS Score", _fmt(ragas_score, 4))
+    c1.metric(
+        "Rule Score", _fmt(rule_score),
+        delta=_fmt(_delta(rule_score, prev_rule)),
+        help="Structural checks: min length, required sections, keyword presence",
+    )
+    c2.metric(
+        "Judge Score",
+        _fmt(judge_score) if judge_score is not None else "—",
+        help="LLM-as-Judge: regulatory quality scored on 5 criteria (factual accuracy, regulatory language, site specificity, completeness, coherence)",
+    )
+    c3.metric(
+        "Faithfulness",
+        _fmt(mean_faith, 3) if mean_faith is not None else "—",
+        help="DeepEval: fraction of generated claims grounded in source documents (0–1). Low = hallucination.",
+    )
+    c4.metric(
+        "RAG Triad",
+        _fmt(rag_triad, 3) if rag_triad is not None else "—",
+        help="DeepEval RAG Triad: harmonic mean of Faithfulness + Contextual Precision + Answer Relevancy (0–1)",
+    )
     c5.metric("Composite", _fmt(composite))
+
+    # ── Opik-style metric row ────────────────────────────────────────────
+    _hallucination = ext.get("mean_hallucination_score")
+    _answer_rel = ext.get("mean_answer_relevance_score")
+    _reg_tone = ext.get("mean_regulatory_tone_score")
+    _opik_composite = ext.get("mean_opik_composite")
+
+    _has_opik = any(v is not None for v in [_hallucination, _answer_rel, _reg_tone])
+    if _has_opik:
+        st.markdown(
+            '<p style="font-size:0.78rem;color:#6b7280;margin:12px 0 4px 0;font-weight:600;">'
+            'OPIK-STYLE METRICS (direct continuous scoring)</p>',
+            unsafe_allow_html=True,
+        )
+        oc1, oc2, oc3, oc4 = st.columns(4)
+        _hall_disp = f"{(1.0 - _hallucination):.3f}" if _hallucination is not None else "—"
+        oc1.metric(
+            "Groundedness",
+            _hall_disp,
+            help="Opik: 1 − Hallucination Score. 1.0 = fully grounded, 0 = complete hallucination. "
+                 "Only invented factual claims (names, numbers, certifications) are penalised — "
+                 "regulatory boilerplate is NOT penalised.",
+        )
+        oc2.metric(
+            "Answer Relevance",
+            _fmt(_answer_rel, 3) if _answer_rel is not None else "—",
+            help="Opik: Direct continuous score (0–1) for how well the output addresses the "
+                 "section instruction. Faster and more holistic than DeepEval's reverse-question method.",
+        )
+        oc3.metric(
+            "Regulatory Tone",
+            _fmt(_reg_tone, 3) if _reg_tone is not None else "—",
+            help="PMF-specific metric (not in vanilla Opik): scores language appropriateness for "
+                 "EU GMP Annex 4 / ICH Q10 regulatory submission (0 = informal, 1 = exemplary).",
+        )
+        oc4.metric(
+            "Opik Composite",
+            _fmt(_opik_composite, 3) if _opik_composite is not None else "—",
+            help="Mean of Groundedness + Answer Relevance + Regulatory Tone.",
+        )
+
+    # ── MLflow tracking link ─────────────────────────────────────────────
+    _run_arts = payload.get("run_artifacts", payload)
+    _mlflow_run_id = _run_arts.get("mlflow_run_id")
+    _mlflow_url = _run_arts.get("mlflow_ui_url", "http://localhost:5000")
+    if _mlflow_run_id:
+        st.markdown(
+            f'<div style="margin:8px 0 4px 0;">'
+            f'<a href="{_mlflow_url}" target="_blank" style="font-size:0.85rem;color:#5340C0;">'
+            f'🔗 Open in MLflow UI &nbsp;<span style="color:#9ca3af;font-size:0.75rem;">'
+            f'(run: {_mlflow_run_id[:8]}…)</span></a>'
+            f'&nbsp;&nbsp;<span style="color:#6b7280;font-size:0.78rem;">'
+            f'Run <code>mlflow ui</code> in the project folder to start the server.</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption(
+            "MLflow tracking: run `mlflow ui` in the project folder → "
+            "open http://localhost:5000 to compare runs over time."
+        )
 
     # ── Metric tooltips ─────────────────────────────────────────────────
     with st.expander("What do these metrics mean?"):
         st.markdown(
-            "- **BERTScore** — Measures how semantically similar the "
-            "generated text is to a reference document, using AI-based "
-            "language understanding.\n"
-            "- **Judge Score** — Score assigned by a second AI acting as "
-            "a domain expert evaluating the regulatory quality of the "
-            "output.\n"
-            "- **Faithfulness** (in RAGAS) — Measures whether the AI's "
-            "answer is fully supported by the source documents it "
-            "retrieved — a low score indicates hallucination.\n"
-            "- **RAGAS Score** — Combined quality score of the retrieval "
-            "and generation pipeline."
+            "**Rule Score** — Structural quality checks: minimum character length, "
+            "required sections present, site name referenced.\n\n"
+            "**Judge Score** — A second LLM acts as a domain expert and scores the "
+            "output on 5 PMF-specific criteria: Factual Accuracy, Regulatory Language, "
+            "Site Specificity, Completeness, Structural Coherence. Score: 0–100.\n\n"
+            "**Faithfulness** *(DeepEval)* — Extracts every factual claim from the "
+            "generated text and checks each one against the retrieved source documents. "
+            "Score = supported_claims / total_claims. Low score = hallucination.\n\n"
+            "**Contextual Precision** *(DeepEval)* — Checks whether the most relevant "
+            "retrieved context chunks are ranked first. Rank-weighted Average Precision.\n\n"
+            "**Answer Relevancy** *(DeepEval)* — Generates questions the answer would "
+            "address, then measures how closely they match the original instruction.\n\n"
+            "**RAG Triad** — Harmonic mean of Faithfulness + Contextual Precision + "
+            "Answer Relevancy (0–1 scale). Industry-standard composite for RAG quality.\n\n"
+            "**Composite** — Weighted blend: Rule 20% + Judge 55% + RAG Triad 25%.\n\n"
+            "---\n\n"
+            "**Groundedness** *(Opik-style)* — 1 minus the hallucination score. Single LLM "
+            "call asking for a direct continuous score. Only penalises invented factual claims "
+            "(names, numbers, certifications) — NOT regulatory boilerplate.\n\n"
+            "**Answer Relevance** *(Opik-style)* — How well the output addresses the section "
+            "instruction, scored as a direct continuous value (0–1). One LLM call per section.\n\n"
+            "**Regulatory Tone** *(PMF-specific, not in vanilla Opik)* — Language quality for "
+            "EU GMP Annex 4 / ICH Q10 regulatory submission. 1 = exemplary formal regulatory "
+            "language, 0 = completely inappropriate.\n\n"
+            "**Opik Composite** — Mean of Groundedness + Answer Relevance + Regulatory Tone.\n\n"
+            "*DeepEval vs Opik*: DeepEval extracts discrete claims and checks each one (binary, "
+            "multi-call). Opik asks the LLM for one direct continuous score per section (faster, "
+            "captures nuance). Both frameworks complement each other."
         )
 
     # ── Grade badge ──────────────────────────────────────────────────────
@@ -330,9 +503,16 @@ def _render_tab_overview(runs: List[Dict[str, Any]]) -> None:
     badge_html = _grade_badge_html(grade)
     status = "PASS" if passed else "FAIL"
     status_clr = CLR_SUCCESS if passed else CLR_DANGER
+    _framework_label = ""
+    _fw = ext.get("framework", "")
+    if "opik_style" in _fw:
+        _framework_label = ' &nbsp;<span style="font-size:0.75rem;color:#6b7280;font-weight:400;">DeepEval + Opik-style</span>'
+    elif "deepeval" in _fw or ext.get("mean_rag_triad_score") is not None:
+        _framework_label = ' &nbsp;<span style="font-size:0.75rem;color:#6b7280;font-weight:400;">DeepEval RAG Triad</span>'
     st.markdown(
         f"{badge_html} &nbsp; "
-        f'<span style="color:{status_clr};font-weight:700;">{status}</span>',
+        f'<span style="color:{status_clr};font-weight:700;">{status}</span>'
+        f"{_framework_label}",
         unsafe_allow_html=True,
     )
 
@@ -405,13 +585,20 @@ def _render_download_report(
 
     # ── Metric scores table ──────────────────────────────────────────
     doc.add_heading("Metric Scores", level=1)
+    _rag_val = ext.get("mean_rag_triad_score") or ext.get("mean_ragas")
+    _hall = ext.get("mean_hallucination_score")
     metrics = [
         ("Rule Score", _fmt(rule_score)),
-        ("BERTScore F1", _fmt(ext.get("mean_bertscore_f1"), 4)),
-        ("Judge Normalized", _fmt(ext.get("mean_judge_normalized"))),
-        ("RAGAS Score", _fmt(ext.get("mean_ragas"), 4)),
+        ("Judge Score", _fmt(ext.get("mean_judge_normalized"))),
+        ("Faithfulness (DeepEval)", _fmt(ext.get("mean_faithfulness"), 4)),
+        ("RAG Triad Score (DeepEval)", _fmt(_rag_val, 4)),
         ("Composite", _fmt(ext.get("mean_composite", rule_score))),
+        ("Groundedness (Opik)", _fmt((1.0 - _hall) if _hall is not None else None, 4)),
+        ("Answer Relevance (Opik)", _fmt(ext.get("mean_answer_relevance_score"), 4)),
+        ("Regulatory Tone (Opik)", _fmt(ext.get("mean_regulatory_tone_score"), 4)),
+        ("Opik Composite", _fmt(ext.get("mean_opik_composite"), 4)),
         ("Retrieval Coverage", f"{eval_data.get('retrieval_coverage', 0)}%"),
+        ("Framework", ext.get("framework", "rule-based")),
     ]
     tbl2 = doc.add_table(rows=len(metrics), cols=2, style="Light Grid Accent 1")
     for i, (label, val) in enumerate(metrics):
@@ -508,52 +695,98 @@ def _render_download_report(
 
 
 def _render_live_evaluation() -> None:
-    """Paste-and-evaluate: runs metrics + judge on arbitrary text."""
-    st.subheader("Live Evaluation")
+    """Smart evaluation panel — rule-based runs automatically, reference metrics optional."""
+    st.subheader("Quick Text Evaluation")
     st.caption(
-        "Paste any generated and reference text below to evaluate quality "
-        "in real time — the primary demo feature for stakeholder presentations."
+        "Paste any generated PMF text to evaluate it instantly. "
+        "**Rule-based checks run without any reference text.** "
+        "Add a reference text on the right to also compute BLEU / ROUGE / BERTScore."
     )
+
+    # ── Auto-populate from the last generated run ─────────────────────
+    auto_gen = ""
+    auto_sec = "EXECUTIVE SUMMARY"
+    _runs = _load_runs()
+    if _runs:
+        _rf = _runs[0].get("run_file", "")
+        if _rf and os.path.exists(_rf):
+            try:
+                _payload = _load_run_payload(_rf)
+                for _sec in _payload.get("run_artifacts", {}).get("sections", []):
+                    _gt = _sec.get("generated_text", "")
+                    if _gt.strip() and "static" not in _sec.get("section_key", "").lower():
+                        auto_gen = _gt[:2500]
+                        auto_sec = _sec.get("section_key", auto_sec)
+                        break
+            except Exception:
+                pass
 
     lc1, lc2 = st.columns(2)
     with lc1:
         gen_text = st.text_area(
-            "Paste generated text here", height=180, key="live_gen_txt",
+            "Generated text",
+            value=auto_gen,
+            height=200,
+            key="live_gen_txt",
+            help="Auto-populated from your last run. Edit or paste any text to evaluate.",
         )
     with lc2:
         ref_text = st.text_area(
-            "Paste reference text here", height=180, key="live_ref_txt",
+            "Reference text (optional)",
+            height=200,
+            key="live_ref_txt",
+            help=(
+                "Leave blank — rule-based and judge metrics work without it. "
+                "Paste a ground-truth PMF section here to also compute BLEU / ROUGE / BERTScore."
+            ),
         )
 
     live_section = st.text_input(
-        "Section key (optional)", value="LIVE EVAL", key="live_sec_key",
+        "Section type", value=auto_sec, key="live_sec_key",
+        help="E.g. EXECUTIVE SUMMARY, SITE DESCRIPTION, MANUFACTURING PROCESSES",
     )
 
     if not st.button("Evaluate Now", key="live_eval_now_btn", type="primary"):
         return
 
     if not gen_text.strip():
-        st.warning("Please paste generated text.")
+        st.warning("Paste some generated text first.")
         return
 
-    # ── Phase 1: Lexical metrics (fast, <2s) ─────────────────────────
-    with st.spinner("Computing lexical metrics..."):
-        lex_result: Dict[str, Any] = {}
-        sim_result: float = 0.0
-        if HAS_METRICS and ref_text.strip():
-            lex_result = LexicalMetrics.compute_all_lexical(gen_text, ref_text)
+    has_ref = bool(ref_text.strip())
 
-    # Show lexical results immediately
-    st.subheader("Results")
-    r1, r2, r3, r4 = st.columns(4)
-    r1.metric("BLEU", _fmt(lex_result.get("bleu"), 2))
-    r2.metric("ROUGE-1 F1", _fmt(lex_result.get("rouge1_fmeasure"), 4))
-    r3.metric("ROUGE-L F1", _fmt(lex_result.get("rougeL_fmeasure"), 4))
+    # ── Phase 1: Rule-based checks (always — no reference needed) ─────
+    rule_score = 0.0
+    rule_checks: Dict[str, Any] = {}
+    missing_kw: List[str] = []
+    with st.spinner("Running rule-based quality checks..."):
+        try:
+            _rule_result = score_section(
+                section_key=live_section,
+                section_text=gen_text,
+                rules=get_eval_rules(),
+                context={},
+            )
+            rule_score = float(_rule_result.get("score", 0))
+            rule_checks = _rule_result.get("checks", {})
+            missing_kw = _rule_result.get("missing_keywords", [])
+        except Exception as exc:
+            logger.warning("Rule scoring failed in live eval: %s", exc)
 
-    # ── Phase 2: BERTScore (if enabled, ~3-5s) ──────────────────────
+    # ── Phase 2: Lexical metrics (BLEU / ROUGE) — needs reference ─────
+    lex_result: Dict[str, Any] = {}
+    if HAS_LEXICAL and has_ref:
+        with st.spinner("Computing BLEU / ROUGE..."):
+            try:
+                lex_result = LexicalMetrics.compute_all_lexical(gen_text, ref_text)
+            except Exception as exc:
+                logger.warning("Lexical metrics failed in live eval: %s", exc)
+
+    # ── Phase 3: BERTScore — needs reference + semantic toggle ────────
     bert_f1: Any = None
-    if st.session_state.get("toggle_semantic", False) and HAS_METRICS and ref_text.strip():
-        with st.spinner("Computing BERTScore..."):
+    sim_result: float = 0.0
+    if st.session_state.get("toggle_semantic", False) and HAS_SEMANTIC and has_ref:
+        with st.spinner("Computing BERTScore (this may take a few seconds)..."):
             try:
                 sm = SemanticMetrics(model_type="distilbert-base-uncased")
                 bs = sm.compute_bertscore([gen_text], [ref_text])
@@ -561,25 +794,39 @@ def _render_live_evaluation() -> None:
                 sim_result = sm.compute_semantic_similarity(gen_text, ref_text)
             except Exception as exc:
                 logger.warning("BERTScore failed in live eval: %s", exc)
-    r4.metric("BERTScore F1", _fmt(bert_f1, 4))
 
-    # ── Phase 3: LLM Judge (if enabled, ~5-15s) ─────────────────────
+    # ── Phase 4: LLM Judge (if enabled, ~30-60s) ─────────────────────
     judge_result: Dict[str, Any] = {}
     if st.session_state.get("toggle_judge", False):
-        with st.spinner("Running LLM Judge evaluation..."):
+        with st.spinner("Running LLM Judge (30-60 s)..."):
             try:
                 from src.eval.eval_judge import PMFJudge
-                api_key = st.session_state.get("sidebar_anthropic_key", "")
-                model = st.session_state.get("sidebar_judge_model", "claude-sonnet-4-6")
-                judge = PMFJudge(
-                    provider="anthropic",
-                    model=model,
-                    api_key=api_key,
-                    cache_enabled=False,
-                )
+                from dotenv import load_dotenv
+                load_dotenv()
+                # Prefer Azure OpenAI (already configured) over Anthropic
+                _azure_key = os.getenv("AZURE_KEY", os.getenv("AZURE_OPENAI_API_KEY", ""))
+                _azure_ep = os.getenv("AZURE_ENDPOINT", os.getenv("AZURE_OPENAI_ENDPOINT", ""))
+                _azure_ver = os.getenv("AZURE_VERSION", os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01"))
+                _azure_name = os.getenv("AZURE_NAME", "gpt-4o")
+
+                if _azure_key and _azure_ep:
+                    judge = PMFJudge(
+                        provider="azure_openai",
+                        model=_azure_name,
+                        api_key=_azure_key,
+                        azure_endpoint=_azure_ep,
+                        azure_api_version=_azure_ver,
+                        cache_enabled=False,
+                    )
+                else:
+                    # Fallback to sidebar Anthropic key
+                    api_key = st.session_state.get("sidebar_anthropic_key", "")
+                    model = st.session_state.get("sidebar_judge_model", "claude-sonnet-4-6")
+                    judge = PMFJudge(provider="anthropic", model=model, api_key=api_key, cache_enabled=False)
+
                 judge_result = judge.score_section(
                     section_key=live_section,
-                    section_instruction="Evaluate this section.",
+                    section_instruction="Evaluate this PMF section for regulatory quality.",
                     retrieved_context="",
                     generated_output=gen_text,
                     site_name="",
@@ -589,7 +836,92 @@ def _render_live_evaluation() -> None:
                 logger.warning("Judge failed in live eval: %s", exc)
                 judge_result = {"judge_error": True, "error": str(exc)}
 
-    # ── Display judge results ────────────────────────────────────────
+    # ── Phase 5: DeepEval RAG Triad (if enabled) ──────────────────────
+    rag_result: Dict[str, Any] = {}
+    if st.session_state.get("toggle_rag", False):
+        with st.spinner("Running DeepEval RAG Triad (Faithfulness + Contextual Precision + Answer Relevancy)..."):
+            try:
+                from src.eval.eval_rag import RAGEvaluator
+                from openai import AzureOpenAI
+                from dotenv import load_dotenv
+                load_dotenv()
+                _azure_key = os.getenv("AZURE_KEY", os.getenv("AZURE_OPENAI_API_KEY", ""))
+                _azure_ep = os.getenv("AZURE_ENDPOINT", os.getenv("AZURE_OPENAI_ENDPOINT", ""))
+                _azure_ver = os.getenv("AZURE_VERSION", os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01"))
+                _azure_name = os.getenv("AZURE_NAME", "gpt-4o")
+
+                _client = AzureOpenAI(api_key=_azure_key, api_version=_azure_ver, azure_endpoint=_azure_ep)
+                rag_ev = RAGEvaluator(llm_client=_client, model=_azure_name, cache_enabled=False)
+                rag_result = rag_ev.evaluate_section(
+                    section_key=live_section,
+                    section_instruction=live_section,
+                    retrieved_chunks=[ref_text] if ref_text.strip() else [],
+                    generated_answer=gen_text,
+                )
+            except Exception as exc:
+                logger.warning("RAG Triad eval failed in live eval: %s", exc)
+                rag_result = {"error": str(exc)}
+
+    # ── Results display ───────────────────────────────────────────────
+    st.subheader("Evaluation Results")
+
+    grade = _letter_grade(rule_score)
+    badge_html = _grade_badge_html(grade)
+    passed = rule_score >= 65.0
+    status = "PASS" if passed else "NEEDS IMPROVEMENT"
+    status_clr = CLR_SUCCESS if passed else CLR_WARNING
+    st.markdown(
+        f"{badge_html} &nbsp;"
+        f'<span style="color:{status_clr};font-weight:700;">{status}</span>'
+        f"&nbsp; Rule Score: <strong>{_fmt(rule_score)}/100</strong>",
+        unsafe_allow_html=True,
+    )
+
+    st.write("")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Rule Score", _fmt(rule_score),
+              help="Structural quality: min length, required sections, site name presence")
+    m2.metric("BLEU", _fmt(lex_result.get("bleu"), 2) if lex_result else "N/A",
+              help="Lexical overlap with reference (0–100). Needs reference text.")
+    m3.metric("ROUGE-1 F1", _fmt(lex_result.get("rouge1_fmeasure"), 4) if lex_result else "N/A",
+              help="Unigram overlap F1 with reference. Needs reference text.")
+    _faith_live = rag_result.get("faithfulness")
+    _rt_live = rag_result.get("rag_triad_score") or rag_result.get("ragas_score")
+    m4.metric("Faithfulness",
+              _fmt(_faith_live, 3) if _faith_live is not None else "N/A",
+              help="DeepEval: claims grounded in source context. Enable 'DeepEval RAG Triad' in sidebar.")
+    m5.metric("RAG Triad",
+              _fmt(_rt_live, 3) if _rt_live is not None else "N/A",
+              help="DeepEval composite: Faithfulness + Contextual Precision + Answer Relevancy")
+
+    # Rule check breakdown
+    if rule_checks:
+        with st.expander("Rule Check Details", expanded=True):
+            for check_name, check_passed in rule_checks.items():
+                icon = "✓" if check_passed else "✗"
+                clr = CLR_SUCCESS if check_passed else CLR_DANGER
+                label = check_name.replace("_", " ").replace("passed", "").strip().title()
+                st.markdown(
+                    f'<span style="color:{clr};font-weight:600;">{icon} {label}</span>',
+                    unsafe_allow_html=True,
+                )
+        if missing_kw:
+            st.warning(f"Missing keywords: {', '.join(missing_kw)}")
+
+    if not has_ref:
+        st.info(
+            "**BLEU / ROUGE / BERTScore** require a reference text — paste a ground-truth "
+            "PMF section in the right box to compute them. "
+            "The rule-based score above works without any reference."
+        )
+
+    if not st.session_state.get("toggle_semantic") and has_ref and HAS_SEMANTIC:
+        st.caption(
+            "BERTScore is available but disabled. "
+            "Enable 'Run Semantic (BERTScore)' in the sidebar to compute it."
+        )
+
+    # ── Judge results ─────────────────────────────────────────────────
     if judge_result and not judge_result.get("judge_error"):
         st.subheader("LLM Judge Assessment")
         jc1, jc2, jc3, jc4, jc5 = st.columns(5)
@@ -603,8 +935,7 @@ def _render_live_evaluation() -> None:
         norm = judge_result.get("normalized_score", 0)
         j_grade = _letter_grade(float(norm))
         st.markdown(
-            f"**Normalized Score:** {_fmt(norm)} / 100 &nbsp; "
-            f"{_grade_badge_html(j_grade)}",
+            f"**Judge Score:** {_fmt(norm)} / 100 &nbsp; {_grade_badge_html(j_grade)}",
             unsafe_allow_html=True,
         )
 
@@ -613,23 +944,54 @@ def _render_live_evaluation() -> None:
             st.markdown(f"**Weaknesses:** {', '.join(judge_result.get('weaknesses', [])) or '—'}")
             critical = judge_result.get("critical_issues", [])
             if critical:
-                st.error(f"Critical: {', '.join(critical)}")
+                st.error(f"Critical Issues: {', '.join(critical)}")
             st.markdown(f"**Notes:** {judge_result.get('evaluation_notes', '—')}")
+
     elif judge_result.get("judge_error"):
         st.warning(
             f"Judge evaluation failed: {judge_result.get('error', 'unknown')}. "
-            "Check your API key in the sidebar."
+            "Check Azure OpenAI credentials in .env file."
         )
 
-    # ── Full JSON result (expandable) ────────────────────────────────
+    # ── DeepEval RAG Triad results ────────────────────────────────────
+    if rag_result and not rag_result.get("error"):
+        st.subheader("DeepEval RAG Triad")
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        rc1.metric("Faithfulness", _fmt(rag_result.get("faithfulness"), 3),
+                   help="Claims grounded in context (0–1)")
+        rc2.metric("Ctx Precision", _fmt(rag_result.get("contextual_precision") or rag_result.get("context_precision"), 3),
+                   help="Relevant contexts ranked first (0–1)")
+        rc3.metric("Answer Relevancy", _fmt(rag_result.get("answer_relevancy"), 3),
+                   help="Answer addresses the question (0–1)")
+        _rt = rag_result.get("rag_triad_score") or rag_result.get("ragas_score")
+        rc4.metric("RAG Triad", _fmt(_rt, 3), help="Harmonic mean of the three metrics (0–1)")
+
+        with st.expander("RAG Triad Details"):
+            claims = rag_result.get("faithfulness_claims", [])
+            if claims:
+                st.markdown(f"**Claims extracted:** {len(claims)}")
+                for c in claims[:5]:
+                    icon = "✓" if c.get("supported") else "✗"
+                    clr = CLR_SUCCESS if c.get("supported") else CLR_DANGER
+                    st.markdown(
+                        f'<span style="color:{clr};">{icon}</span> {c.get("claim", "?")}',
+                        unsafe_allow_html=True,
+                    )
+            gen_qs = rag_result.get("generated_questions", [])
+            if gen_qs:
+                st.markdown(f"**Generated questions (Answer Relevancy):** {', '.join(gen_qs)}")
+    elif rag_result.get("error"):
+        st.warning(f"DeepEval RAG Triad failed: {rag_result.get('error')}. Check Azure credentials.")
+
+    # ── Full JSON (expandable) ────────────────────────────────────────
     with st.expander("Full Results (JSON)"):
-        full = {
-            "lexical": lex_result,
-            "bertscore_f1": bert_f1,
-            "semantic_similarity": sim_result,
+        st.json({
+            "rule_score": rule_score,
+            "rule_checks": rule_checks,
+            "lexical": lex_result if lex_result else "N/A — no reference text",
+            "deepeval_rag_triad": rag_result if rag_result else None,
             "judge": judge_result if judge_result else None,
-        }
-        st.json(full)
+        })
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -681,10 +1043,10 @@ def _render_tab_heatmap(runs: List[Dict[str, Any]]) -> None:
         heatmap_rows.append({
             "Section": key[:35],
             "Rule Score": s.get("score", 0),
-            "BERTScore F1": _safe_pct(sem.get("bertscore_f1_mean")),
             "Judge Score": judge.get("normalized_score"),
             "Faithfulness": _safe_pct(rag.get("faithfulness")),
-            "Ctx Precision": _safe_pct(rag.get("context_precision")),
+            "Ctx Precision": _safe_pct(rag.get("contextual_precision") or rag.get("context_precision")),
+            "RAG Triad": _safe_pct(rag.get("rag_triad_score") or rag.get("ragas_score")),
         })
 
     df = pd.DataFrame(heatmap_rows).set_index("Section")
@@ -692,8 +1054,7 @@ def _render_tab_heatmap(runs: List[Dict[str, Any]]) -> None:
     # Replace None with NaN for Styler
     df = df.where(df.notna(), other=float("nan"))
 
-    metric_cols = ["Rule Score", "BERTScore F1", "Judge Score",
-                   "Faithfulness", "Ctx Precision"]
+    metric_cols = ["Rule Score", "Judge Score", "Faithfulness", "Ctx Precision", "RAG Triad"]
 
     st.subheader("Section Heatmap")
     st.caption("Green (>80) | Yellow (50-80) | Red (<50). Blank = metric not computed.")
@@ -739,10 +1100,12 @@ def _render_tab_heatmap(runs: List[Dict[str, Any]]) -> None:
 
     sc1, sc2, sc3, sc4, sc5 = st.columns(5)
     sc1.metric("Rule", _fmt(rule_sec.get("score")))
-    sc2.metric("BLEU", _fmt(lex.get("bleu")))
-    sc3.metric("BERTScore F1", _fmt(sem.get("bertscore_f1_mean"), 4))
-    sc4.metric("Judge Norm.", _fmt(judge.get("normalized_score")))
-    sc5.metric("Faithfulness", _fmt(rag.get("faithfulness"), 4))
+    sc2.metric("Judge Score", _fmt(judge.get("normalized_score")))
+    sc3.metric("Faithfulness", _fmt(rag.get("faithfulness"), 4))
+    _cp = rag.get("contextual_precision") or rag.get("context_precision")
+    sc4.metric("Ctx Precision", _fmt(_cp, 4))
+    _rt = rag.get("rag_triad_score") or rag.get("ragas_score")
+    sc5.metric("RAG Triad", _fmt(_rt, 4))
 
     # Judge qualitative output
     if judge and not judge.get("judge_error"):
@@ -1115,11 +1478,243 @@ def _render_tab_benchmark() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# TAB 6 — PERFORMANCE (latency · failures · improvements)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _render_tab_performance(runs: List[Dict[str, Any]]) -> None:
+    """Latency breakdown, failure analysis, and improvement recommendations."""
+
+    if not runs:
+        st.info("No runs available. Generate a PMF document first.")
+        return
+
+    # ── Run selector ──────────────────────────────────────────────────
+    labels = [
+        f"{r.get('timestamp', '')}  |  {r.get('site_name', '')}  |  score={r.get('overall_score', '?')}"
+        for r in runs
+    ]
+    idx = st.selectbox("Run", range(len(runs)), format_func=lambda i: labels[i],
+                       key="perf_run_sel")
+    run_meta = runs[idx]
+    payload = _load_run_payload(run_meta.get("run_file", ""))
+    run_arts = payload.get("run_artifacts", payload)
+    perf = run_arts.get("performance_report", {})
+
+    # ── View toggle: Plain English / Technical ─────────────────────────
+    view = st.radio("View mode", ["Plain English", "Technical"], horizontal=True,
+                    key="perf_view_mode",
+                    help="Plain English: for non-technical stakeholders. Technical: for engineers.")
+    is_tech = view == "Technical"
+
+    st.divider()
+
+    # ── Summary banner ────────────────────────────────────────────────
+    summary = perf.get("summary_technical" if is_tech else "summary_plain", "")
+    if summary:
+        st.info(summary)
+    else:
+        st.info("No performance data available for this run. Performance tracking is captured from the next document generation onwards.")
+        _render_performance_legend()
+        return
+
+    # ── Overall timing cards ──────────────────────────────────────────
+    ot = perf.get("overall_timing", {})
+    total_s = (ot.get("total_pipeline_ms") or 0) / 1000
+    gen_s   = (ot.get("total_generation_ms") or 0) / 1000
+    ret_s   = (ot.get("total_retrieval_ms") or 0) / 1000
+    eval_s  = (ot.get("total_eval_ms") or 0) / 1000
+    avg_s   = (ot.get("avg_section_ms") or 0) / 1000
+
+    st.subheader("Overall Timing")
+    tc1, tc2, tc3, tc4, tc5 = st.columns(5)
+    tc1.metric("Total Time",       f"{total_s:.1f}s" if total_s else "—",
+               help="End-to-end pipeline: retrieval + generation + evaluation")
+    tc2.metric("LLM Generation",   f"{gen_s:.1f}s"   if gen_s  else "—",
+               help="Cumulative time spent calling the LLM across all sections")
+    tc3.metric("Retrieval",        f"{ret_s:.1f}s"   if ret_s  else "—",
+               help="Cumulative time spent querying the vector database")
+    tc4.metric("Evaluation",       f"{eval_s:.1f}s"  if eval_s else "—",
+               help="Cumulative time running DeepEval + Opik metrics")
+    tc5.metric("Avg / Section",    f"{avg_s:.1f}s"   if avg_s  else "—",
+               help="Average time per section (total ÷ section count)")
+
+    # ── Time breakdown donut chart ────────────────────────────────────
+    if HAS_PLOTLY and gen_s + ret_s + eval_s > 0:
+        other_s = max(0, total_s - gen_s - ret_s - eval_s)
+        fig_donut = go.Figure(go.Pie(
+            labels=["LLM Generation", "Retrieval", "Evaluation", "Other"],
+            values=[gen_s, ret_s, eval_s, other_s],
+            hole=0.55,
+            marker_colors=["#5340C0", "#1D9E75", "#BA7517", "#d1d5db"],
+            textinfo="label+percent",
+            hovertemplate="%{label}: %{value:.1f}s (%{percent})<extra></extra>",
+        ))
+        fig_donut.update_layout(
+            margin=dict(t=30, b=10, l=10, r=10),
+            height=260,
+            showlegend=False,
+            title_text="Time Breakdown",
+            title_x=0.5,
+        )
+        st.plotly_chart(fig_donut, use_container_width=True)
+
+    st.divider()
+
+    # ── Per-section latency bar chart ─────────────────────────────────
+    st.subheader("Section Latency")
+    section_timings = perf.get("section_timings", [])
+    if section_timings:
+        df_timing = pd.DataFrame([
+            {
+                "Section": t["section_key"][:45],
+                "Retrieval (s)":  round((t.get("retrieval_ms") or 0) / 1000, 2),
+                "Generation (s)": round((t.get("generation_ms") or 0) / 1000, 2),
+                "Evaluation (s)": round((t.get("eval_ms") or 0) / 1000, 2),
+                "Total (s)":      round((t.get("total_ms") or 0) / 1000, 2),
+                "Static":         t.get("is_static", False),
+            }
+            for t in section_timings
+        ])
+        # Sort slowest first
+        df_timing = df_timing.sort_values("Total (s)", ascending=False)
+
+        if HAS_PLOTLY:
+            fig_bar = px.bar(
+                df_timing,
+                x="Total (s)",
+                y="Section",
+                orientation="h",
+                color="Total (s)",
+                color_continuous_scale=["#1D9E75", "#BA7517", "#D85A30"],
+                labels={"Total (s)": "Time (seconds)", "Section": ""},
+                title="Time per Section (slowest first)",
+                height=max(300, len(df_timing) * 28),
+            )
+            fig_bar.update_coloraxes(showscale=False)
+            fig_bar.update_layout(margin=dict(t=40, b=20, l=10, r=20), yaxis_autorange="reversed")
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+            # Stacked breakdown chart
+            df_stack = df_timing[["Section", "Retrieval (s)", "Generation (s)", "Evaluation (s)"]].copy()
+            fig_stack = px.bar(
+                df_stack.melt(id_vars="Section", var_name="Phase", value_name="Time (s)"),
+                x="Time (s)",
+                y="Section",
+                color="Phase",
+                orientation="h",
+                color_discrete_map={
+                    "Retrieval (s)":  "#1D9E75",
+                    "Generation (s)": "#5340C0",
+                    "Evaluation (s)": "#BA7517",
+                },
+                title="Phase Breakdown per Section",
+                height=max(300, len(df_timing) * 28),
+            )
+            fig_stack.update_layout(margin=dict(t=40, b=20, l=10, r=20), yaxis_autorange="reversed",
+                                    legend_title_text="Phase")
+            st.plotly_chart(fig_stack, use_container_width=True)
+        else:
+            st.dataframe(df_timing[["Section", "Retrieval (s)", "Generation (s)", "Evaluation (s)", "Total (s)"]],
+                         use_container_width=True, hide_index=True)
+
+        slowest = ot.get("slowest_section")
+        if slowest:
+            st.caption(f"Slowest section: **{slowest}** ({(ot.get('slowest_section_ms') or 0)/1000:.1f}s)")
+    else:
+        st.info("Section timing data not available for this run.")
+
+    st.divider()
+
+    # ── Failures table ────────────────────────────────────────────────
+    st.subheader("Issues Detected")
+    failures = perf.get("failures", [])
+
+    if failures:
+        SEVERITY_ICON = {"critical": "🔴", "warning": "🟡", "info": "🔵"}
+        SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
+
+        df_fail = pd.DataFrame([
+            {
+                "Severity":  SEVERITY_ICON.get(f["severity"], "") + " " + f["severity"].upper(),
+                "Section":   f["section_key"][:45],
+                "Type":      f["failure_type"].replace("_", " ").title(),
+                "Details":   f["plain_english"] if not is_tech else f["technical"],
+                "Metric":    f"{f['metric_value']:.3f}" if f.get("metric_value") is not None else "—",
+                "_sev_ord":  SEVERITY_ORDER.get(f["severity"], 9),
+            }
+            for f in failures
+        ])
+        df_fail = df_fail.sort_values("_sev_ord").drop(columns=["_sev_ord"])
+
+        st.dataframe(df_fail, use_container_width=True, hide_index=True,
+                     column_config={
+                         "Details": st.column_config.TextColumn("Details", width="large"),
+                     })
+
+        n_crit = sum(1 for f in failures if f["severity"] == "critical")
+        n_warn = sum(1 for f in failures if f["severity"] == "warning")
+        n_info = sum(1 for f in failures if f["severity"] == "info")
+        st.caption(f"🔴 {n_crit} critical &nbsp; 🟡 {n_warn} warnings &nbsp; 🔵 {n_info} informational")
+    else:
+        st.success("No issues detected. All sections generated and evaluated successfully.")
+
+    st.divider()
+
+    # ── Improvement recommendations ───────────────────────────────────
+    st.subheader("Improvement Recommendations")
+    improvements = perf.get("improvements", [])
+
+    if improvements:
+        PRIORITY_ICON = {"high": "🔥", "medium": "📌", "low": "💡"}
+        PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+        improvements_sorted = sorted(improvements, key=lambda x: PRIORITY_ORDER.get(x.get("priority", "low"), 9))
+
+        for imp in improvements_sorted:
+            priority = imp.get("priority", "low")
+            area = imp.get("area", "General")
+            icon = PRIORITY_ICON.get(priority, "💡")
+            desc = imp["technical"] if is_tech else imp["plain_english"]
+            affected = imp.get("affected_sections", [])
+
+            with st.expander(f"{icon} **{area}** — {priority.upper()} priority", expanded=(priority == "high")):
+                st.markdown(desc)
+                if affected:
+                    st.caption(
+                        "Affected sections: "
+                        + ", ".join(f"`{s[:40]}`" for s in affected[:6])
+                        + (" …" if len(affected) > 6 else "")
+                    )
+    else:
+        st.success("No improvements identified — the pipeline is running optimally.")
+
+    _render_performance_legend()
+
+
+def _render_performance_legend() -> None:
+    with st.expander("How to read this tab"):
+        st.markdown(
+            "**Total Time** — how long the entire document generation + evaluation took.\n\n"
+            "**LLM Generation** — time the AI spent writing each section. "
+            "This is usually the largest chunk.\n\n"
+            "**Retrieval** — time spent searching your uploaded documents for relevant content.\n\n"
+            "**Evaluation** — time spent running quality checks (DeepEval + Opik metrics).\n\n"
+            "**🔴 Critical issues** — sections that could not be generated at all. Must be fixed.\n\n"
+            "**🟡 Warnings** — sections with quality concerns (possible inaccuracies, low scores). "
+            "Should be reviewed before submission.\n\n"
+            "**🔵 Informational** — minor observations (e.g. slightly informal language). "
+            "Optional to address.\n\n"
+            "**🔥 High priority improvements** — actions that will most improve document quality.\n\n"
+            "**📌 Medium priority** — worthwhile improvements for the next run.\n\n"
+            "**💡 Low priority** — optimisations for speed or efficiency."
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN RENDER
 # ═══════════════════════════════════════════════════════════════════════════
 
 def render_eval_dashboard() -> None:
-    """Render the complete 5-tab evaluation dashboard."""
+    """Render the complete 6-tab evaluation dashboard."""
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
     st.markdown(
         '<div class="dashboard-header">'
@@ -1133,9 +1728,9 @@ def render_eval_dashboard() -> None:
 
     runs = _load_runs()
 
-    t1, t2, t3, t4, t5 = st.tabs([
+    t1, t2, t3, t4, t5, t6 = st.tabs([
         "Run Overview", "Section Heatmap", "Trend Analysis",
-        "Model Comparison", "Benchmark Management",
+        "Model Comparison", "Benchmark Management", "⚡ Performance",
     ])
 
     with t1:
@@ -1148,6 +1743,8 @@ def render_eval_dashboard() -> None:
         _render_tab_model_comparison()
     with t5:
         _render_tab_benchmark()
+    with t6:
+        _render_tab_performance(runs)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
