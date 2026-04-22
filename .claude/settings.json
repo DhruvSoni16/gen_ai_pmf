@@ -4,7 +4,9 @@
       "Bash(venv/Scripts/python.exe -c \"import nltk; print\\('nltk OK', nltk.__version__\\)\")",
       "Bash(venv/Scripts/python.exe -m streamlit run app.py --server.headless true --server.port 8502)",
       "Bash(kill %1)",
-      "Bash(python)"
+      "Bash(python)",
+      "Bash(venv/Scripts/python generate_docs.py)",
+      "Bash(echo \"EXIT: $?\")"
     ]
   }
 }
