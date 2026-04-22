@@ -1,15 +1,27 @@
 import os
 import fitz  # PyMuPDF
 import docx  # python-docx
-from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
 import pickle
- 
+
+try:
+    from sentence_transformers import SentenceTransformer
+    _ST_AVAILABLE = True
+except Exception as _st_err:
+    _ST_AVAILABLE = False
+    _ST_LOAD_ERR = _st_err
+
 class DocumentRetriever:
     # def __init__(self, documents_dir, vector_db_path="vector_db", model_name="all-MiniLM-L6-v2"):
     def __init__(self, documents_dir, vector_db_path="vector_db", model_name="all-mpnet-base-v2"):
- 
+        if not _ST_AVAILABLE:
+            raise RuntimeError(
+                f"sentence_transformers could not be loaded ({_ST_LOAD_ERR}). "
+                "Fix torch by running:\n"
+                "  pip uninstall torch torchvision torchaudio -y\n"
+                "  pip install torch --index-url https://download.pytorch.org/whl/cpu"
+            )
         print("Initializing DocumentRetriever...")
         self.documents_dir = documents_dir
         self.vector_db_path = vector_db_path
