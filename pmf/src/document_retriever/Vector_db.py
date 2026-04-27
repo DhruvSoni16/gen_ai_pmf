@@ -5,209 +5,209 @@ import faiss
 import numpy as np
 import pickle
 
+# Try sentence_transformers (requires torch). If torch DLLs fail on Windows,
+# fall back to TF-IDF + TruncatedSVD which needs only scikit-learn.
+_BACKEND = "none"
 try:
     from sentence_transformers import SentenceTransformer
-    _ST_AVAILABLE = True
+    _BACKEND = "st"
+    print("[DocumentRetriever] Using sentence_transformers backend.")
 except Exception as _st_err:
-    _ST_AVAILABLE = False
-    _ST_LOAD_ERR = _st_err
+    print(f"[DocumentRetriever] sentence_transformers unavailable ({_st_err}), trying TF-IDF fallback.")
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.decomposition import TruncatedSVD
+        _BACKEND = "tfidf"
+        print("[DocumentRetriever] Using TF-IDF + SVD backend.")
+    except Exception as _sk_err:
+        print(f"[DocumentRetriever] sklearn also unavailable ({_sk_err}). No embedding backend found.")
+
+
+class _TFIDFModel:
+    """TF-IDF + TruncatedSVD drop-in for SentenceTransformer. No torch required."""
+    DIM = 512
+
+    def __init__(self):
+        self._tfidf = TfidfVectorizer(max_features=30000, sublinear_tf=True)
+        self._svd = TruncatedSVD(n_components=self.DIM, random_state=0)
+        self.fitted = False
+
+    def fit(self, texts: list):
+        mat = self._tfidf.fit_transform(texts)
+        nc = min(self.DIM, mat.shape[1] - 1, mat.shape[0] - 1)
+        self._svd.n_components = max(1, nc)
+        self._svd.fit(mat)
+        self.fitted = True
+
+    def encode(self, text, convert_to_tensor=False):
+        if not self.fitted:
+            raise RuntimeError("TF-IDF model has not been fitted yet. Call process_documents() first.")
+        single = isinstance(text, str)
+        texts = [text] if single else list(text)
+        emb = self._svd.transform(self._tfidf.transform(texts)).astype(np.float32)
+        return emb[0] if single else emb
+
+
+def _to_numpy(embedding):
+    """Convert a tensor or array to a plain float32 numpy array."""
+    if hasattr(embedding, "detach"):
+        embedding = embedding.detach().cpu().numpy()
+    return np.array(embedding, dtype=np.float32)
+
 
 class DocumentRetriever:
-    # def __init__(self, documents_dir, vector_db_path="vector_db", model_name="all-MiniLM-L6-v2"):
     def __init__(self, documents_dir, vector_db_path="vector_db", model_name="all-mpnet-base-v2"):
-        if not _ST_AVAILABLE:
+        if _BACKEND == "none":
             raise RuntimeError(
-                f"sentence_transformers could not be loaded ({_ST_LOAD_ERR}). "
-                "Fix torch by running:\n"
-                "  pip uninstall torch torchvision torchaudio -y\n"
-                "  pip install torch --index-url https://download.pytorch.org/whl/cpu"
+                "No embedding backend is available. Install sentence_transformers or scikit-learn."
             )
-        print("Initializing DocumentRetriever...")
+        print(f"Initializing DocumentRetriever (backend={_BACKEND})...")
         self.documents_dir = documents_dir
         self.vector_db_path = vector_db_path
-        self.model = SentenceTransformer(model_name)
+        self._model_name = model_name
         self.index = None
         self.document_info = {}
         self.embeddings = None
- 
-        # Ensure vector database directory exists
+
+        if _BACKEND == "st":
+            self.model = SentenceTransformer(model_name)
+        else:
+            self.model = _TFIDFModel()
+
         os.makedirs(vector_db_path, exist_ok=True)
         print("Initialization complete.")
- 
+
     def clear_database(self):
-        """Clear the vector database and FAISS index."""
         print("Clearing existing vector database...")
-        db_file = os.path.join(self.vector_db_path, "vector_db.pkl")
-        index_file = os.path.join(self.vector_db_path, "faiss_index.bin")
- 
-        if os.path.exists(db_file):
-            os.remove(db_file)
-            print(f"Deleted database file: {db_file}")
-        if os.path.exists(index_file):
-            os.remove(index_file)
-            print(f"Deleted FAISS index file: {index_file}")
- 
+        for fname in ("vector_db.pkl", "faiss_index.bin"):
+            path = os.path.join(self.vector_db_path, fname)
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"Deleted: {path}")
+
     def extract_text_from_pdf(self, pdf_path):
-        """Extract text from a PDF file."""
         print(f"Extracting text from PDF: {pdf_path}")
         try:
             doc = fitz.open(pdf_path)
-            text = ""
-            for page in doc:
-                text += page.get_text()
+            text = "".join(page.get_text() for page in doc)
             print(f"Extracted {len(text)} characters from PDF.")
             return text
         except Exception as e:
             print(f"Error extracting text from PDF {pdf_path}: {e}")
             return ""
- 
+
     def extract_text_from_docx(self, docx_path):
-        """Extract text from a DOCX file."""
         print(f"Extracting text from DOCX: {docx_path}")
         try:
             doc = docx.Document(docx_path)
-            text = ""
-            for paragraph in doc.paragraphs:
-                text += paragraph.text + "\n"
+            text = "\n".join(p.text for p in doc.paragraphs)
             print(f"Extracted {len(text)} characters from DOCX.")
             return text
         except Exception as e:
             print(f"Error extracting text from DOCX {docx_path}: {e}")
             return ""
- 
+
     def extract_text_from_file(self, file_path):
-        """Extract text based on file type."""
-        print(f"Determining file type for: {file_path}")
         if file_path.endswith(".pdf"):
             return self.extract_text_from_pdf(file_path)
         elif file_path.endswith(".docx"):
             return self.extract_text_from_docx(file_path)
-        else:
-            print(f"Unsupported file type: {file_path}")
-            return ""
- 
+        print(f"Unsupported file type: {file_path}")
+        return ""
+
     def generate_embedding(self, text):
-        """Generate and normalize embedding for the given text."""
-        print(f"Generating embedding for text of length {len(text)}...")
         if not text.strip():
-            print("Text is empty. Skipping embedding generation.")
             return None
- 
         try:
-            # Generate embedding
-            embedding = self.model.encode(text, convert_to_tensor=True)  # Returns a PyTorch tensor
-            embedding = embedding.detach().cpu().numpy()  # Convert tensor to NumPy array
- 
-            # Normalize embedding
-            norm = np.linalg.norm(embedding)
+            emb = _to_numpy(self.model.encode(text, convert_to_tensor=(_BACKEND == "st")))
+            norm = np.linalg.norm(emb)
             if norm == 0:
-                print("Embedding norm is zero. Skipping normalization.")
                 return None
-            embedding = embedding / norm
-            print("Embedding generated and normalized successfully.")
-            return embedding
+            return emb / norm
         except Exception as e:
             print(f"Error generating embedding: {e}")
             return None
- 
-    
- 
+
     def process_documents(self):
-        """Process documents and build the vector database using IndexHNSWFlat."""
         print("Starting document processing...")
-        self.clear_database()  # Clear the database before processing
- 
+        self.clear_database()
+
         db_file = os.path.join(self.vector_db_path, "vector_db.pkl")
         index_file = os.path.join(self.vector_db_path, "faiss_index.bin")
- 
-        print("Processing documents...")
-        all_embeddings = []
-        doc_id = 0
- 
+
+        # Collect valid files and their texts
+        file_texts = []
+        file_paths = []
         for file in os.listdir(self.documents_dir):
             file_path = os.path.join(self.documents_dir, file)
             if os.path.isfile(file_path) and file.lower().endswith((".pdf", ".docx")):
-                print(f"Processing file: {file}")
                 text = self.extract_text_from_file(file_path)
-                if not text:
-                    print(f"Skipping empty document: {file}")
-                    continue
- 
-                # Generate embedding for the document
-                print(f"Generating embedding for document: {file}")
-                embedding = self.generate_embedding(text)
-                if embedding is None:
-                    print(f"Skipping document due to embedding generation failure: {file}")
-                    continue
-                all_embeddings.append(embedding)
- 
-                # Save document info
-                self.document_info[doc_id] = {"path": file_path, "filename": file}
-                doc_id += 1
- 
-        # Build FAISS index
-        if all_embeddings:
-            print("Building FAISS index using IndexHNSWFlat...")
-            self.embeddings = np.vstack(all_embeddings).astype(np.float32)
-            print(f"Embeddings shape: {self.embeddings.shape}, dtype: {self.embeddings.dtype}")
- 
-            dimension = self.embeddings.shape[1]
-            self.index = faiss.IndexHNSWFlat(dimension, 32)  # 32 is the number of neighbors in the graph
-            print(f"FAISS index dimensionality: {self.index.d}, number of neighbors: 32")
- 
-            # Add embeddings to the index
-            try:
-                self.index.add(self.embeddings)
-                print("Embeddings added to FAISS index successfully.")
-            except Exception as e:
-                print(f"Error adding embeddings to FAISS index: {e}")
-                return
- 
-            # Save vector database and index
-            print("Saving vector database...")
-            with open(db_file, "wb") as f:
-                pickle.dump({"document_info": self.document_info, "embeddings": self.embeddings}, f)
- 
-            print("Saving FAISS index...")
-            faiss.write_index(self.index, index_file)
-            print(f"Processed {len(self.document_info)} documents.")
-        else:
+                if text:
+                    file_texts.append(text)
+                    file_paths.append((file_path, file))
+
+        if not file_texts:
             print("No documents were processed.")
- 
-    def search(self, query, top_k=5):
-        """Search for relevant documents based on a query."""
-        print(f"Starting search for query: {query}")
-        if self.index is None:
-            print("FAISS index is not initialized. Run process_documents() first.")
-            return []
- 
-        # Generate query embedding
-        print("Generating embedding for query...")
-        query_embedding = self.model.encode(query, convert_to_tensor=True)
-        query_embedding = query_embedding.detach().cpu().numpy()  # Convert tensor to NumPy array
-        query_embedding = query_embedding / np.linalg.norm(query_embedding)  # Normalize
-        query_embedding = np.array([query_embedding]).astype(np.float32)
- 
-        # Check query embedding shape
-        print(f"Query embedding shape: {query_embedding.shape}")
-        if query_embedding.shape[1] != self.index.d:
-            print(f"Query embedding dimension mismatch. Expected {self.index.d}, got {query_embedding.shape[1]}.")
-            return []
- 
-        # Search the index
-        print("Searching FAISS index...")
-        distances, indices = self.index.search(query_embedding, top_k)
-        print("Search completed.")
- 
-        # Retrieve document info
-        print("Processing search results...")
-        results = []
-        for i, (distance, idx) in enumerate(zip(distances[0], indices[0])):
-            if idx < 0 or idx >= len(self.document_info):
+            return
+
+        # TF-IDF needs to be fitted on the full corpus before encoding
+        if _BACKEND == "tfidf":
+            print("Fitting TF-IDF model on corpus...")
+            self.model.fit(file_texts)
+
+        # Generate embeddings
+        all_embeddings = []
+        doc_id = 0
+        for text, (file_path, file) in zip(file_texts, file_paths):
+            print(f"Generating embedding for: {file}")
+            embedding = self.generate_embedding(text)
+            if embedding is None:
+                print(f"Skipping {file}: embedding failed.")
                 continue
-            doc_info = self.document_info[idx]
-            results.append((doc_info["path"], doc_info["filename"], distance))
- 
-        print(f"Search complete. Found {len(results)} results.")
+            all_embeddings.append(embedding)
+            self.document_info[doc_id] = {"path": file_path, "filename": file}
+            doc_id += 1
+
+        # Build FAISS index
+        print("Building FAISS index...")
+        self.embeddings = np.vstack(all_embeddings).astype(np.float32)
+        print(f"Embeddings shape: {self.embeddings.shape}")
+        dimension = self.embeddings.shape[1]
+        self.index = faiss.IndexHNSWFlat(dimension, 32)
+        self.index.add(self.embeddings)
+        print("Embeddings added to FAISS index.")
+
+        # Persist
+        with open(db_file, "wb") as f:
+            pickle.dump({
+                "document_info": self.document_info,
+                "embeddings": self.embeddings,
+                "tfidf_model": self.model if _BACKEND == "tfidf" else None,
+            }, f)
+        faiss.write_index(self.index, index_file)
+        print(f"Processed {len(self.document_info)} documents.")
+
+    def search(self, query, top_k=5):
+        print(f"Searching for: {query}")
+        if self.index is None:
+            print("FAISS index not initialized. Run process_documents() first.")
+            return []
+
+        q_emb = _to_numpy(self.model.encode(query, convert_to_tensor=(_BACKEND == "st")))
+        norm = np.linalg.norm(q_emb)
+        if norm > 0:
+            q_emb = q_emb / norm
+        q_emb = q_emb.reshape(1, -1).astype(np.float32)
+
+        if q_emb.shape[1] != self.index.d:
+            print(f"Dimension mismatch: index={self.index.d}, query={q_emb.shape[1]}")
+            return []
+
+        distances, indices = self.index.search(q_emb, top_k)
+        results = []
+        for distance, idx in zip(distances[0], indices[0]):
+            if 0 <= idx < len(self.document_info):
+                info = self.document_info[idx]
+                results.append((info["path"], info["filename"], distance))
+        print(f"Found {len(results)} results.")
         return results
- 

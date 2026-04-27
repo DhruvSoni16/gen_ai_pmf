@@ -251,10 +251,9 @@ def _run_extended_evaluation(run_artifacts, eval_suite):
         gen_phase = run_artifacts["timing"].get("generation_phase_ms") or 0
         run_artifacts["timing"]["total_pipeline_ms"] = round(gen_phase + _total_eval_ms, 1)
 
-    # Re-save with all extended eval data
+    # Re-evaluate with all extended data (rule scores + extended metrics)
     rules = get_eval_rules()
     evaluation = evaluate_run(run_artifacts, rules)
-    save_eval_run(run_artifacts, evaluation)
 
     # ── Performance analysis (latency + failures + improvements) ─────
     try:
@@ -283,6 +282,9 @@ def _run_extended_evaluation(run_artifacts, eval_suite):
         logging.info("MLflow run logged: %s", mlflow_run_id)
     except Exception as exc:
         logging.warning("MLflow logging failed: %s", exc)
+
+    # ── Save everything to disk (after performance + MLflow are set) ──
+    save_eval_run(run_artifacts, evaluation)
 
     logging.info(
         "Evaluation complete — composite=%.1f grade=%s | judge=%.1f | "
@@ -404,6 +406,9 @@ def extraction_pmf(template_file_path):
     
 
 
+
+    # TEST MODE: limit to first 5 sections for fast iteration — remove this line for full runs
+    template_json = dict(list(template_json.items())[:5])
 
     for key,value in template_json.items():
        

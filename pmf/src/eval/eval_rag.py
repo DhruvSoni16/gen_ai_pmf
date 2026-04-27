@@ -134,10 +134,12 @@ def _parse_json_lenient(raw: str) -> Any:
 
 
 def _harmonic_mean(values: List[float]) -> float:
-    positive = [v for v in values if v > 0]
-    if not positive:
+    if not values:
         return 0.0
-    return len(positive) / sum(1.0 / v for v in positive)
+    # Any zero metric fails the whole triad (standard harmonic mean behaviour)
+    if any(v <= 0 for v in values):
+        return 0.0
+    return len(values) / sum(1.0 / v for v in values)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
