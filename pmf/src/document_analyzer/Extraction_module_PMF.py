@@ -87,166 +87,190 @@ def convert_dict(list):
 
 
 
-def _run_extended_evaluation(run_artifacts, eval_suite):
-    """Run extended evaluation: DeepEval RAG Triad + Opik-style + MLflow logging.
-
-    Per section: appends 'extended_eval' (DeepEval results) and
-    'opik_eval' (hallucination / answer_relevance / regulatory_tone).
-    Document level: saves 'extended_eval_summary' and logs to MLflow.
-    """
+def _build_opik_scorer(run_artifacts):
+    """Construct the OpikStyleScorer using Azure creds from run_artifacts."""
     from src.eval.eval_opik_style import OpikStyleScorer
-    from src.eval.eval_mlflow_tracker import MLflowTracker
     from openai import AzureOpenAI
 
-    logging.info("Running extended evaluation (DeepEval + Opik-style + MLflow)...")
+    key = run_artifacts.get("_azure_key", "")
+    endpoint = run_artifacts.get("_azure_endpoint", "")
+    version = run_artifacts.get("_azure_version", "2024-06-01")
+    name = run_artifacts.get("model_name", "gpt-4o")
 
-    # Build shared Azure client for Opik scorer
-    _azure_key = run_artifacts.get("_azure_key", "")
-    _azure_ep = run_artifacts.get("_azure_endpoint", "")
-    _azure_ver = run_artifacts.get("_azure_version", "2024-06-01")
-    _azure_name = run_artifacts.get("model_name", "gpt-4o")
+    if not (key and endpoint):
+        return None
 
-    opik_scorer = None
     try:
-        if _azure_key and _azure_ep:
-            _client = AzureOpenAI(api_key=_azure_key, api_version=_azure_ver, azure_endpoint=_azure_ep)
-            opik_scorer = OpikStyleScorer(llm_client=_client, model=_azure_name)
+        client = AzureOpenAI(api_key=key, api_version=version, azure_endpoint=endpoint)
+        return OpikStyleScorer(llm_client=client, model=name)
     except Exception as exc:
         logging.warning("Opik scorer init failed: %s", exc)
+        return None
 
-    section_results = []
-    _eval_phase_start = time.perf_counter()
 
-    for section in run_artifacts.get("sections", []):
-        if section.get("is_static", False):
-            continue
-        generated = section.get("generated_text", "")
-        if not generated.strip():
-            continue
+def _load_retrieved_chunks(retrieved_paths):
+    """Extract text from retrieved files using the same extractor as generation.
 
-        section_key = section.get("section_key", "")
-        instruction = section.get("prompt_text", "")
-        retrieved_chunks = []
-        for p in section.get("retrieved_paths", []):
-            try:
-                with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                    chunk = f.read()[:4000]
-                    retrieved_chunks.append(chunk)
-            except Exception:
-                pass
-
-        merged_context = "\n\n".join(retrieved_chunks)
-        _sec_eval_start = time.perf_counter()
-
-        # ── DeepEval (Judge + RAG Triad) ─────────────────────────────
+    Uses data_extraction() so PDFs/docx/xlsx are parsed properly — reading them
+    as UTF-8 yields binary garbage, which makes the faithfulness judge score 0
+    even when the docs contain the supporting evidence.
+    """
+    chunks = []
+    for p in retrieved_paths:
         try:
-            result = eval_suite.run(
-                generated=generated,
-                retrieved=retrieved_chunks,
-                reference="",
-                section_key=section_key,
-                section_instruction=instruction,
-                site_name=run_artifacts.get("site_name", ""),
-            )
-            section["extended_eval"] = result.to_dict()
-            section_results.append(result)
+            text = data_extraction([p])
+            if text:
+                chunks.append(text[:8000])
         except Exception as exc:
-            logging.warning("DeepEval failed for '%s': %s", section_key, exc)
+            logging.warning("Failed to extract text from '%s': %s", p, exc)
+    return chunks
 
-        # ── Opik-style (Hallucination + Answer Relevance + Regulatory Tone) ──
-        if opik_scorer:
-            try:
-                opik_result = opik_scorer.evaluate_section(
-                    section_key=section_key,
-                    output=generated,
-                    context=merged_context,
-                    instruction=instruction,
-                )
-                section["opik_eval"] = opik_result
-            except Exception as exc:
-                logging.warning("Opik scoring failed for '%s': %s", section_key, exc)
 
-        # Store eval timing back into the section's timing dict
-        _sec_eval_ms = round((time.perf_counter() - _sec_eval_start) * 1000, 1)
-        if "timing" not in section or section["timing"] is None:
-            section["timing"] = {}
-        section["timing"]["eval_ms"] = _sec_eval_ms
-        section["timing"]["total_ms"] = round(
-            (section["timing"].get("retrieval_ms") or 0)
-            + (section["timing"].get("generation_ms") or 0)
-            + _sec_eval_ms,
-            1,
+def _run_deepeval_for_section(eval_suite, section, generated, retrieved_chunks, site_name, section_results):
+    """Run DeepEval (Judge + RAG Triad) on one section; mutate section + section_results."""
+    try:
+        result = eval_suite.run(
+            generated=generated,
+            retrieved=retrieved_chunks,
+            reference="",
+            section_key=section.get("section_key", ""),
+            section_instruction=section.get("prompt_text", ""),
+            site_name=site_name,
         )
+        section["extended_eval"] = result.to_dict()
+        section_results.append(result)
+    except Exception as exc:
+        logging.warning("DeepEval failed for '%s': %s", section.get("section_key", ""), exc)
 
-    # ── Document-level aggregation ────────────────────────────────────
+
+def _run_opik_for_section(opik_scorer, section, generated, merged_context):
+    """Run Opik-style scoring on one section; mutate section in place."""
+    if not opik_scorer:
+        return
+    try:
+        section["opik_eval"] = opik_scorer.evaluate_section(
+            section_key=section.get("section_key", ""),
+            output=generated,
+            context=merged_context,
+            instruction=section.get("prompt_text", ""),
+        )
+    except Exception as exc:
+        logging.warning("Opik scoring failed for '%s': %s", section.get("section_key", ""), exc)
+
+
+def _stamp_section_eval_timing(section, sec_eval_ms):
+    """Update the section's timing dict with eval_ms and total_ms."""
+    if "timing" not in section or section["timing"] is None:
+        section["timing"] = {}
+    section["timing"]["eval_ms"] = sec_eval_ms
+    section["timing"]["total_ms"] = round(
+        (section["timing"].get("retrieval_ms") or 0)
+        + (section["timing"].get("generation_ms") or 0)
+        + sec_eval_ms,
+        1,
+    )
+
+
+def _evaluate_one_section(section, eval_suite, opik_scorer, site_name, section_results):
+    """Run all per-section eval steps. Returns False if section was skipped."""
+    generated = section.get("generated_text", "")
+    if not generated.strip():
+        return False
+
+    retrieved_chunks = _load_retrieved_chunks(section.get("retrieved_paths", []))
+    merged_context = "\n\n".join(retrieved_chunks)
+
+    sec_start = time.perf_counter()
+    _run_deepeval_for_section(eval_suite, section, generated, retrieved_chunks, site_name, section_results)
+    _run_opik_for_section(opik_scorer, section, generated, merged_context)
+    _stamp_section_eval_timing(section, round((time.perf_counter() - sec_start) * 1000, 1))
+    return True
+
+
+def _mean(vals):
+    """Mean of non-None values, rounded to 4 decimals; None if empty."""
+    clean = [float(v) for v in vals if v is not None]
+    return round(sum(clean) / len(clean), 4) if clean else None
+
+
+def _aggregate_deepeval(section_results):
+    """Aggregate DeepEval section results into doc-level means + grade distribution."""
     from collections import Counter
-    from healthark_eval.suite import _grade
 
-    def _mean(vals):
-        clean = [float(v) for v in vals if v is not None]
-        return round(sum(clean) / len(clean), 4) if clean else None
+    if not section_results:
+        return {"mean_composite": 0.0, "grade_dist": {},
+                "mean_judge": None, "mean_rag": None, "mean_faith": None}
 
-    if section_results:
-        composites = [r.composite_score for r in section_results]
-        mean_composite = round(sum(composites) / len(composites), 2)
-        grade_dist = dict(Counter(r.grade for r in section_results))
-
-        mean_judge = _mean([
+    composites = [r.composite_score for r in section_results]
+    return {
+        "mean_composite": round(sum(composites) / len(composites), 2),
+        "grade_dist": dict(Counter(r.grade for r in section_results)),
+        "mean_judge": _mean([
             r.judge_scores.get("normalized_score")
             for r in section_results
             if r.judge_scores and not r.judge_scores.get("judge_error")
-        ])
-        mean_rag = _mean([
+        ]),
+        "mean_rag": _mean([
             r.rag_scores.get("rag_triad_score") or r.rag_scores.get("ragas_score")
             for r in section_results if r.rag_scores
-        ])
-        mean_faith = _mean([
+        ]),
+        "mean_faith": _mean([
             r.rag_scores.get("faithfulness")
             for r in section_results if r.rag_scores
-        ])
-    else:
-        mean_composite, grade_dist = 0.0, {}
-        mean_judge = mean_rag = mean_faith = None
+        ]),
+    }
 
-    # Opik document-level aggregation
-    opik_sections = [s.get("opik_eval", {}) for s in run_artifacts.get("sections", []) if s.get("opik_eval")]
-    mean_hallucination = _mean([s.get("hallucination_score") for s in opik_sections])
-    mean_answer_rel = _mean([s.get("answer_relevance_score") for s in opik_sections])
-    mean_reg_tone = _mean([s.get("regulatory_tone_score") for s in opik_sections])
-    mean_opik_composite = _mean([s.get("opik_composite") for s in opik_sections])
 
-    run_artifacts["extended_eval_summary"] = {
-        "mean_composite": mean_composite,
-        "overall_grade": _grade(mean_composite),
-        "sections_evaluated": len(section_results),
-        "grade_distribution": grade_dist,
-        # DeepEval metrics
-        "mean_judge_normalized": mean_judge,
-        "mean_rag_triad_score": mean_rag,
-        "mean_faithfulness": mean_faith,
+def _aggregate_opik(run_artifacts):
+    """Aggregate Opik-style scores from all sections that ran Opik."""
+    opik_sections = [
+        s.get("opik_eval", {})
+        for s in run_artifacts.get("sections", [])
+        if s.get("opik_eval")
+    ]
+    return {
+        "mean_hallucination": _mean([s.get("hallucination_score") for s in opik_sections]),
+        "mean_answer_rel": _mean([s.get("answer_relevance_score") for s in opik_sections]),
+        "mean_reg_tone": _mean([s.get("regulatory_tone_score") for s in opik_sections]),
+        "mean_opik_composite": _mean([s.get("opik_composite") for s in opik_sections]),
+    }
+
+
+def _build_extended_summary(deep, opik, sections_evaluated):
+    """Combine DeepEval + Opik aggregates into the final extended_eval_summary dict."""
+    from healthark_eval.suite import _grade
+
+    return {
+        "mean_composite": deep["mean_composite"],
+        "overall_grade": _grade(deep["mean_composite"]),
+        "sections_evaluated": sections_evaluated,
+        "grade_distribution": deep["grade_dist"],
+        "mean_judge_normalized": deep["mean_judge"],
+        "mean_rag_triad_score": deep["mean_rag"],
+        "mean_faithfulness": deep["mean_faith"],
         "mean_bertscore_f1": None,
-        # Opik-style metrics
-        "mean_hallucination_score": mean_hallucination,
-        "mean_answer_relevance_score": mean_answer_rel,
-        "mean_regulatory_tone_score": mean_reg_tone,
-        "mean_opik_composite": mean_opik_composite,
-        # Backwards-compat
-        "mean_ragas": mean_rag,
+        "mean_hallucination_score": opik["mean_hallucination"],
+        "mean_answer_relevance_score": opik["mean_answer_rel"],
+        "mean_regulatory_tone_score": opik["mean_reg_tone"],
+        "mean_opik_composite": opik["mean_opik_composite"],
+        "mean_ragas": deep["mean_rag"],
         "framework": "deepeval_rag_triad + opik_style",
     }
 
-    # ── Finalise overall pipeline timing ─────────────────────────────
-    _total_eval_ms = round((time.perf_counter() - _eval_phase_start) * 1000, 1)
-    if "timing" in run_artifacts and run_artifacts["timing"] is not None:
-        run_artifacts["timing"]["total_eval_ms"] = _total_eval_ms
-        gen_phase = run_artifacts["timing"].get("generation_phase_ms") or 0
-        run_artifacts["timing"]["total_pipeline_ms"] = round(gen_phase + _total_eval_ms, 1)
 
-    # Re-evaluate with all extended data (rule scores + extended metrics)
-    rules = get_eval_rules()
-    evaluation = evaluate_run(run_artifacts, rules)
+def _finalise_pipeline_timing(run_artifacts, eval_phase_start):
+    """Stamp total_eval_ms and total_pipeline_ms on run_artifacts['timing']."""
+    total_eval_ms = round((time.perf_counter() - eval_phase_start) * 1000, 1)
+    timing = run_artifacts.get("timing")
+    if timing is None:
+        return
+    timing["total_eval_ms"] = total_eval_ms
+    gen_phase = timing.get("generation_phase_ms") or 0
+    timing["total_pipeline_ms"] = round(gen_phase + total_eval_ms, 1)
 
-    # ── Performance analysis (latency + failures + improvements) ─────
+
+def _run_performance_analysis(run_artifacts, evaluation):
+    """Run PerformanceAnalyzer and stash report on run_artifacts."""
     try:
         from src.eval.eval_performance import PerformanceAnalyzer
         perf_report = PerformanceAnalyzer().analyze(run_artifacts, evaluation)
@@ -260,7 +284,10 @@ def _run_extended_evaluation(run_artifacts, eval_suite):
     except Exception as exc:
         logging.warning("Performance analysis failed: %s", exc)
 
-    # ── MLflow tracking ───────────────────────────────────────────────
+
+def _log_to_mlflow(run_artifacts, evaluation):
+    """Log this run to MLflow and store run id + UI URL on run_artifacts."""
+    from src.eval.eval_mlflow_tracker import MLflowTracker
     try:
         tracker = MLflowTracker()
         mlflow_run_id = tracker.log_run(
@@ -274,15 +301,47 @@ def _run_extended_evaluation(run_artifacts, eval_suite):
     except Exception as exc:
         logging.warning("MLflow logging failed: %s", exc)
 
-    # ── Save everything to disk (after performance + MLflow are set) ──
+
+def _run_extended_evaluation(run_artifacts, eval_suite):
+    """Run extended evaluation: DeepEval RAG Triad + Opik-style + MLflow logging.
+
+    Per section: appends 'extended_eval' (DeepEval results) and 'opik_eval'
+    (hallucination / answer_relevance / regulatory_tone). Document level:
+    saves 'extended_eval_summary' and logs to MLflow.
+    """
+    from healthark_eval.suite import _grade
+
+    logging.info("Running extended evaluation (DeepEval + Opik-style + MLflow)...")
+
+    opik_scorer = _build_opik_scorer(run_artifacts)
+    section_results = []
+    eval_phase_start = time.perf_counter()
+    site_name = run_artifacts.get("site_name", "")
+
+    for section in run_artifacts.get("sections", []):
+        _evaluate_one_section(section, eval_suite, opik_scorer, site_name, section_results)
+
+    deep = _aggregate_deepeval(section_results)
+    opik = _aggregate_opik(run_artifacts)
+    run_artifacts["extended_eval_summary"] = _build_extended_summary(
+        deep, opik, sections_evaluated=len(section_results)
+    )
+
+    _finalise_pipeline_timing(run_artifacts, eval_phase_start)
+
+    rules = get_eval_rules()
+    evaluation = evaluate_run(run_artifacts, rules)
+
+    _run_performance_analysis(run_artifacts, evaluation)
+    _log_to_mlflow(run_artifacts, evaluation)
     save_eval_run(run_artifacts, evaluation)
 
     logging.info(
         "Evaluation complete — composite=%.1f grade=%s | judge=%.1f | "
         "rag_triad=%.3f | hallucination=%.3f | reg_tone=%.3f",
-        mean_composite, _grade(mean_composite),
-        mean_judge or 0.0, mean_rag or 0.0,
-        mean_hallucination or 0.0, mean_reg_tone or 0.0,
+        deep["mean_composite"], _grade(deep["mean_composite"]),
+        deep["mean_judge"] or 0.0, deep["mean_rag"] or 0.0,
+        opik["mean_hallucination"] or 0.0, opik["mean_reg_tone"] or 0.0,
     )
 
 

@@ -359,7 +359,7 @@ def process_text_with_GPT(text, reference_content, llm,client):
     ]
 
     # Invoke the model
-    response = llm(messages)
+    response = llm.invoke(messages)
 
     # Return the content text from the response
     return response.content
