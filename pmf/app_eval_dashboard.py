@@ -342,42 +342,38 @@ def _render_tab_overview(runs: List[Dict[str, Any]]) -> None:
     mean_faith = ext.get("mean_faithfulness")
     composite = ext.get("mean_composite", rule_score)
 
-    # ── Smart health summary (plain-English) ─────────────────────────────
-    _grade_val = _letter_grade(float(composite or rule_score or 0))
-    _passed = float(composite or rule_score or 0) >= 65.0
-    _site = run_meta.get("site_name", "")
-    _sec_count = eval_data.get("section_count", 0)
-    _missing = eval_data.get("missing_required_sections", [])
-    _retrieval = eval_data.get("retrieval_coverage", 100)
-    _sections = eval_data.get("sections", [])
-    _worst = sorted(_sections, key=lambda s: s.get("score", 100))[:3]
-
-    # Colour band
-    _health_clr = CLR_SUCCESS if _passed else CLR_DANGER
-    _health_label = "Good Quality" if _grade_val in ("A", "B") else (
-        "Acceptable" if _grade_val == "C" else "Needs Improvement"
-    )
-    st.markdown(
-        f'<div style="background:{_health_clr}22;border-left:4px solid {_health_clr};'
-        f'padding:12px 16px;border-radius:6px;margin-bottom:16px;">'
-        f'<span style="font-size:1.1rem;font-weight:700;color:{_health_clr};">'
-        f'{_grade_badge_html(_grade_val)} &nbsp; {_health_label}</span><br>'
-        f'<span style="color:#374151;">'
-        f'Document for <strong>{_site or "unknown site"}</strong> — '
-        f'{_sec_count} sections evaluated, '
-        f'{_retrieval:.0f}% retrieval coverage'
-        + (f', <strong style="color:{CLR_DANGER};">{len(_missing)} missing required sections</strong>' if _missing else '')
-        + f'</span></div>',
-        unsafe_allow_html=True,
-    )
-
-    if _worst:
-        _low_names = [s.get("section_key", "?")[:40] for s in _worst if s.get("score", 100) < 75]
-        if _low_names:
-            st.warning(
-                f"Sections needing attention: **{', '.join(_low_names)}** — "
-                "see Section Heatmap tab for details."
-            )
+    # ── Metric tooltips (placed near top, just below Evaluation run) ─────
+    with st.expander("What do these metrics mean?"):
+        st.markdown(
+            "**Rule Score** — Structural quality checks: minimum character length, "
+            "required sections present, site name referenced.\n\n"
+            "**Judge Score** — A second LLM acts as a domain expert and scores the "
+            "output on 5 PMF-specific criteria: Factual Accuracy, Regulatory Language, "
+            "Site Specificity, Completeness, Structural Coherence. Score: 0–100.\n\n"
+            "**Faithfulness** *(DeepEval)* — Extracts every factual claim from the "
+            "generated text and checks each one against the retrieved source documents. "
+            "Score = supported_claims / total_claims. Low score = hallucination.\n\n"
+            "**Contextual Precision** *(DeepEval)* — Checks whether the most relevant "
+            "retrieved context chunks are ranked first. Rank-weighted Average Precision.\n\n"
+            "**Answer Relevancy** *(DeepEval)* — Generates questions the answer would "
+            "address, then measures how closely they match the original instruction.\n\n"
+            "**RAG Triad** — Harmonic mean of Faithfulness + Contextual Precision + "
+            "Answer Relevancy (0–1 scale). Industry-standard composite for RAG quality.\n\n"
+            "**Composite** — Weighted blend: Rule 20% + Judge 55% + RAG Triad 25%.\n\n"
+            "---\n\n"
+            "**Groundedness** *(Opik-style)* — 1 minus the hallucination score. Single LLM "
+            "call asking for a direct continuous score. Only penalises invented factual claims "
+            "(names, numbers, certifications) — NOT regulatory boilerplate.\n\n"
+            "**Answer Relevance** *(Opik-style)* — How well the output addresses the section "
+            "instruction, scored as a direct continuous value (0–1). One LLM call per section.\n\n"
+            "**Regulatory Tone** *(PMF-specific, not in vanilla Opik)* — Language quality for "
+            "EU GMP Annex 4 / ICH Q10 regulatory submission. 1 = exemplary formal regulatory "
+            "language, 0 = completely inappropriate.\n\n"
+            "**Opik Composite** — Mean of Groundedness + Answer Relevance + Regulatory Tone.\n\n"
+            "*DeepEval vs Opik*: DeepEval extracts discrete claims and checks each one (binary, "
+            "multi-call). Opik asks the LLM for one direct continuous score per section (faster, "
+            "captures nuance). Both frameworks complement each other."
+        )
 
     # ── Metric cards ─────────────────────────────────────────────────────
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -464,70 +460,8 @@ def _render_tab_overview(runs: List[Dict[str, Any]]) -> None:
             "open http://localhost:5000 to compare runs over time."
         )
 
-    # ── Metric tooltips ─────────────────────────────────────────────────
-    with st.expander("What do these metrics mean?"):
-        st.markdown(
-            "**Rule Score** — Structural quality checks: minimum character length, "
-            "required sections present, site name referenced.\n\n"
-            "**Judge Score** — A second LLM acts as a domain expert and scores the "
-            "output on 5 PMF-specific criteria: Factual Accuracy, Regulatory Language, "
-            "Site Specificity, Completeness, Structural Coherence. Score: 0–100.\n\n"
-            "**Faithfulness** *(DeepEval)* — Extracts every factual claim from the "
-            "generated text and checks each one against the retrieved source documents. "
-            "Score = supported_claims / total_claims. Low score = hallucination.\n\n"
-            "**Contextual Precision** *(DeepEval)* — Checks whether the most relevant "
-            "retrieved context chunks are ranked first. Rank-weighted Average Precision.\n\n"
-            "**Answer Relevancy** *(DeepEval)* — Generates questions the answer would "
-            "address, then measures how closely they match the original instruction.\n\n"
-            "**RAG Triad** — Harmonic mean of Faithfulness + Contextual Precision + "
-            "Answer Relevancy (0–1 scale). Industry-standard composite for RAG quality.\n\n"
-            "**Composite** — Weighted blend: Rule 20% + Judge 55% + RAG Triad 25%.\n\n"
-            "---\n\n"
-            "**Groundedness** *(Opik-style)* — 1 minus the hallucination score. Single LLM "
-            "call asking for a direct continuous score. Only penalises invented factual claims "
-            "(names, numbers, certifications) — NOT regulatory boilerplate.\n\n"
-            "**Answer Relevance** *(Opik-style)* — How well the output addresses the section "
-            "instruction, scored as a direct continuous value (0–1). One LLM call per section.\n\n"
-            "**Regulatory Tone** *(PMF-specific, not in vanilla Opik)* — Language quality for "
-            "EU GMP Annex 4 / ICH Q10 regulatory submission. 1 = exemplary formal regulatory "
-            "language, 0 = completely inappropriate.\n\n"
-            "**Opik Composite** — Mean of Groundedness + Answer Relevance + Regulatory Tone.\n\n"
-            "*DeepEval vs Opik*: DeepEval extracts discrete claims and checks each one (binary, "
-            "multi-call). Opik asks the LLM for one direct continuous score per section (faster, "
-            "captures nuance). Both frameworks complement each other."
-        )
-
-    # ── Grade badge ──────────────────────────────────────────────────────
-    grade = ext.get("overall_grade") or _letter_grade(float(composite or rule_score or 0))
-    passed = float(composite or rule_score or 0) >= 65.0
-    badge_html = _grade_badge_html(grade)
-    status = "PASS" if passed else "FAIL"
-    status_clr = CLR_SUCCESS if passed else CLR_DANGER
-    _framework_label = ""
-    _fw = ext.get("framework", "")
-    if "opik_style" in _fw:
-        _framework_label = ' &nbsp;<span style="font-size:0.75rem;color:#6b7280;font-weight:400;">DeepEval + Opik-style</span>'
-    elif "deepeval" in _fw or ext.get("mean_rag_triad_score") is not None:
-        _framework_label = ' &nbsp;<span style="font-size:0.75rem;color:#6b7280;font-weight:400;">DeepEval RAG Triad</span>'
-    st.markdown(
-        f"{badge_html} &nbsp; "
-        f'<span style="color:{status_clr};font-weight:700;">{status}</span>'
-        f"{_framework_label}",
-        unsafe_allow_html=True,
-    )
-
-    # ── Section count, retrieval, missing sections ───────────────────────
-    mc1, mc2, mc3 = st.columns(3)
-    mc1.metric("Section Count", eval_data.get("section_count", 0))
-    mc2.metric("Retrieval Coverage",
-               f"{eval_data.get('retrieval_coverage', 0)}%")
-    missing = eval_data.get("missing_required_sections", [])
-    if missing:
-        mc3.error(f"Missing: {', '.join(missing)}")
-    else:
-        mc3.success("All required sections present")
-
     # ── Download Report (DOCX) ───────────────────────────────────────────
+    grade = ext.get("overall_grade") or _letter_grade(float(composite or rule_score or 0))
     _render_download_report(payload, eval_data, ext, grade, rule_score)
 
     # ── Live Evaluation mode ─────────────────────────────────────────────
@@ -1050,14 +984,8 @@ def _render_tab_heatmap(runs: List[Dict[str, Any]]) -> None:
         st.info("No evaluation runs available. Generate a PMF document first to see results here.")
         return
 
-    # Reuse the same run selector
-    labels = [
-        f"{r.get('timestamp', '')}  |  {r.get('site_name', '')}"
-        for r in runs
-    ]
-    idx = st.selectbox("Select run for heatmap", range(len(runs)),
-                       format_func=lambda i: labels[i], key="tab2_run_sel")
-    run_file = runs[idx].get("run_file", "")
+    # Auto-select the latest run (list is sorted newest first)
+    run_file = runs[0].get("run_file", "")
     if not run_file or not os.path.exists(run_file):
         st.warning(f"Run file not found: {run_file}")
         return
@@ -1533,33 +1461,13 @@ def _render_tab_performance(runs: List[Dict[str, Any]]) -> None:
         st.info("No runs available. Generate a PMF document first.")
         return
 
-    # ── Run selector ──────────────────────────────────────────────────
-    labels = [
-        f"{r.get('timestamp', '')}  |  {r.get('site_name', '')}  |  score={r.get('overall_score', '?')}"
-        for r in runs
-    ]
-    idx = st.selectbox("Run", range(len(runs)), format_func=lambda i: labels[i],
-                       key="perf_run_sel")
-    run_meta = runs[idx]
-    payload = _load_run_payload(run_meta.get("run_file", ""))
+    # Auto-select the latest run (list is sorted newest first)
+    payload = _load_run_payload(runs[0].get("run_file", ""))
     run_arts = payload.get("run_artifacts", payload)
     perf = run_arts.get("performance_report", {})
 
-    # ── View toggle: Plain English / Technical ─────────────────────────
-    view = st.radio("View mode", ["Plain English", "Technical"], horizontal=True,
-                    key="perf_view_mode",
-                    help="Plain English: for non-technical stakeholders. Technical: for engineers.")
-    is_tech = view == "Technical"
-
-    st.divider()
-
-    # ── Summary banner ────────────────────────────────────────────────
-    summary = perf.get("summary_technical" if is_tech else "summary_plain", "")
-    if summary:
-        st.info(summary)
-    else:
+    if not perf:
         st.info("No performance data available for this run. Performance tracking is captured from the next document generation onwards.")
-        _render_performance_legend()
         return
 
     # ── Overall timing cards ──────────────────────────────────────────
@@ -1605,7 +1513,7 @@ def _render_tab_performance(runs: List[Dict[str, Any]]) -> None:
 
     st.divider()
 
-    # ── Per-section latency bar chart ─────────────────────────────────
+    # ── Per-section latency breakdown (phase breakdown chart) ──────────
     st.subheader("Section Latency")
     section_timings = perf.get("section_timings", [])
     if section_timings:
@@ -1624,22 +1532,7 @@ def _render_tab_performance(runs: List[Dict[str, Any]]) -> None:
         df_timing = df_timing.sort_values("Total (s)", ascending=False)
 
         if HAS_PLOTLY:
-            fig_bar = px.bar(
-                df_timing,
-                x="Total (s)",
-                y="Section",
-                orientation="h",
-                color="Total (s)",
-                color_continuous_scale=["#1D9E75", "#BA7517", "#D85A30"],
-                labels={"Total (s)": "Time (seconds)", "Section": ""},
-                title="Time per Section (slowest first)",
-                height=max(300, len(df_timing) * 28),
-            )
-            fig_bar.update_coloraxes(showscale=False)
-            fig_bar.update_layout(margin=dict(t=40, b=20, l=10, r=20), yaxis_autorange="reversed")
-            st.plotly_chart(fig_bar, use_container_width=True)
-
-            # Stacked breakdown chart
+            # Stacked breakdown chart (phase breakdown per section)
             df_stack = df_timing[["Section", "Retrieval (s)", "Generation (s)", "Evaluation (s)"]].copy()
             fig_stack = px.bar(
                 df_stack.melt(id_vars="Section", var_name="Phase", value_name="Time (s)"),
@@ -1652,7 +1545,7 @@ def _render_tab_performance(runs: List[Dict[str, Any]]) -> None:
                     "Generation (s)": "#5340C0",
                     "Evaluation (s)": "#BA7517",
                 },
-                title="Phase Breakdown per Section",
+                title="Phase Breakdown per Section (slowest first)",
                 height=max(300, len(df_timing) * 28),
             )
             fig_stack.update_layout(margin=dict(t=40, b=20, l=10, r=20), yaxis_autorange="reversed",
@@ -1670,88 +1563,27 @@ def _render_tab_performance(runs: List[Dict[str, Any]]) -> None:
 
     st.divider()
 
-    # ── Failures table ────────────────────────────────────────────────
-    st.subheader("Issues Detected")
-    failures = perf.get("failures", [])
-
-    if failures:
-        SEVERITY_ICON = {"critical": "🔴", "warning": "🟡", "info": "🔵"}
-        SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
-
-        df_fail = pd.DataFrame([
-            {
-                "Severity":  SEVERITY_ICON.get(f["severity"], "") + " " + f["severity"].upper(),
-                "Section":   f["section_key"][:45],
-                "Type":      f["failure_type"].replace("_", " ").title(),
-                "Details":   f["plain_english"] if not is_tech else f["technical"],
-                "Metric":    f"{f['metric_value']:.3f}" if f.get("metric_value") is not None else "—",
-                "_sev_ord":  SEVERITY_ORDER.get(f["severity"], 9),
-            }
-            for f in failures
-        ])
-        df_fail = df_fail.sort_values("_sev_ord").drop(columns=["_sev_ord"])
-
-        st.dataframe(df_fail, use_container_width=True, hide_index=True,
-                     column_config={
-                         "Details": st.column_config.TextColumn("Details", width="large"),
-                     })
-
-        n_crit = sum(1 for f in failures if f["severity"] == "critical")
-        n_warn = sum(1 for f in failures if f["severity"] == "warning")
-        n_info = sum(1 for f in failures if f["severity"] == "info")
-        st.caption(f"🔴 {n_crit} critical &nbsp; 🟡 {n_warn} warnings &nbsp; 🔵 {n_info} informational")
-    else:
-        st.success("No issues detected. All sections generated and evaluated successfully.")
-
-    st.divider()
-
-    # ── Improvement recommendations ───────────────────────────────────
-    st.subheader("Improvement Recommendations")
+    # ── Consolidated improvement recommendation (technical perspective) ──
+    st.subheader("Recommendation")
     improvements = perf.get("improvements", [])
 
     if improvements:
-        PRIORITY_ICON = {"high": "🔥", "medium": "📌", "low": "💡"}
-        PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
-        improvements_sorted = sorted(improvements, key=lambda x: PRIORITY_ORDER.get(x.get("priority", "low"), 9))
+        high_priority = [imp for imp in improvements if imp.get("priority") == "high"]
 
-        for imp in improvements_sorted:
-            priority = imp.get("priority", "low")
-            area = imp.get("area", "General")
-            icon = PRIORITY_ICON.get(priority, "💡")
-            desc = imp["technical"] if is_tech else imp["plain_english"]
-            affected = imp.get("affected_sections", [])
-
-            with st.expander(f"{icon} **{area}** — {priority.upper()} priority", expanded=(priority == "high")):
-                st.markdown(desc)
-                if affected:
-                    st.caption(
-                        "Affected sections: "
-                        + ", ".join(f"`{s[:40]}`" for s in affected[:6])
-                        + (" …" if len(affected) > 6 else "")
-                    )
+        if high_priority:
+            primary_rec = high_priority[0]
+            tech_desc = primary_rec.get('technical', primary_rec.get('plain_english', ''))
+            lines = [line.strip() for line in tech_desc.split('\n') if line.strip()]
+            condensed = ' '.join(lines[:3])
+            if len(condensed) > 300:
+                condensed = condensed[:297] + '…'
+            st.markdown(f"**{condensed}**")
+        else:
+            st.success("Pipeline performing optimally — no critical improvements needed.")
     else:
-        st.success("No improvements identified — the pipeline is running optimally.")
-
-    _render_performance_legend()
+        st.success("Pipeline performing optimally — no critical improvements needed.")
 
 
-def _render_performance_legend() -> None:
-    with st.expander("How to read this tab"):
-        st.markdown(
-            "**Total Time** — how long the entire document generation + evaluation took.\n\n"
-            "**LLM Generation** — time the AI spent writing each section. "
-            "This is usually the largest chunk.\n\n"
-            "**Retrieval** — time spent searching your uploaded documents for relevant content.\n\n"
-            "**Evaluation** — time spent running quality checks (DeepEval + Opik metrics).\n\n"
-            "**🔴 Critical issues** — sections that could not be generated at all. Must be fixed.\n\n"
-            "**🟡 Warnings** — sections with quality concerns (possible inaccuracies, low scores). "
-            "Should be reviewed before submission.\n\n"
-            "**🔵 Informational** — minor observations (e.g. slightly informal language). "
-            "Optional to address.\n\n"
-            "**🔥 High priority improvements** — actions that will most improve document quality.\n\n"
-            "**📌 Medium priority** — worthwhile improvements for the next run.\n\n"
-            "**💡 Low priority** — optimisations for speed or efficiency."
-        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
