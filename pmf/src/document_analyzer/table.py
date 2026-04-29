@@ -94,7 +94,7 @@ def derived_table(pdf_text, reference_text, llm,client):
     ]
 
     # Call the AzureChatOpenAI model
-    response = llm(messages)
+    response = llm.invoke(messages)
 
     # Parse the JSON output using JsonOutputParser
     json_parser = JsonOutputParser()
@@ -165,7 +165,7 @@ def derived_static_table(reference_text,llm,client):
     ]
 
     # Call the AzureChatOpenAI model
-    response = llm(messages)
+    response = llm.invoke(messages)
 
     # Parse the JSON output using JsonOutputParser
     json_parser = JsonOutputParser()

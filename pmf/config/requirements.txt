@@ -39,8 +39,15 @@ langchain==0.3.7
 langchain-community==0.3.5
 langchain-core==0.3.15
 langchain-text-splitters==0.3.2
+# langchain-openai provides AzureChatOpenAI used in Extraction_module.py,
+# Extraction_module_PMF.py, text.py, dynamic_template.py, dynamic_template_PMF.py
+langchain-openai==0.2.6
 langsmith==0.1.139
 tiktoken==0.8.0
+
+# ── Anthropic (Claude judge) ──────────────────────────────────────────────────
+# anthropic is used as a lazy import in eval_judge.py and eval_rag.py
+anthropic==0.39.0
 
 # ── Google AI / Generative AI ─────────────────────────────────────────────────
 google-ai-generativelanguage==0.6.10
@@ -168,6 +175,24 @@ rpds-py==0.20.1
 pydantic==2.9.2
 pydantic-settings==2.6.1
 pydantic_core==2.23.4
+
+# ── Visualization ─────────────────────────────────────────────────────────────
+# plotly is used in app_eval_dashboard.py for px (plotly.express) and go (plotly.graph_objects)
+plotly==5.24.1
+
+# ── Evaluation metrics (lexical / semantic) ───────────────────────────────────
+# sacrebleu is used in src/eval/eval_metrics.py for BLEU scoring
+sacrebleu==2.4.3
+# rouge-score is lazily imported in src/eval/eval_metrics.py for ROUGE metrics
+rouge-score==0.1.2
+# bert-score is used in src/eval/eval_metrics.py for semantic similarity
+bert-score==0.3.13
+# nltk is a transitive dep for rouge-score / bert-score
+nltk==3.9.1
+
+# ── Experiment tracking ───────────────────────────────────────────────────────
+# mlflow is lazily imported in src/eval/eval_mlflow_tracker.py
+mlflow==2.17.2
 
 # ── Streamlit internals / UI ──────────────────────────────────────────────────
 altair==5.4.1

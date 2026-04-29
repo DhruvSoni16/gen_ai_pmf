@@ -211,9 +211,8 @@ def handle_text_agent(llm,client,key, value, doc,flag,index,extract_text,pdf_byt
 
     if tool_call["function"]["name"] == "Normal_text_generate":
 
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=170000, chunk_overlap=1000)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=24000, chunk_overlap=800)
         text_chunks = text_splitter.create_documents([extract_text])
-        st.write("chunk size",len(text_chunks))
 
         process_text=""
         for i in text_chunks:
@@ -259,9 +258,8 @@ def handle_text_agent(llm,client,key, value, doc,flag,index,extract_text,pdf_byt
                         
             
     else:
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=175000, chunk_overlap=2000)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=24000, chunk_overlap=800)
         text_chunks = text_splitter.create_documents([extract_text])
-        # text_chunks = text_splitter.create_documents([all_text])
 
         process_text=""
         for i in text_chunks:
@@ -298,7 +296,7 @@ def handle_text_agent(llm,client,key, value, doc,flag,index,extract_text,pdf_byt
 def handle_table_agent(llm,client,key,query, doc,flag,index,extract_text):
     flag = 2
 
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=175000, chunk_overlap=2000)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=24000, chunk_overlap=800)
     text_chunks = text_splitter.create_documents([extract_text])
 
     refined_text = {}

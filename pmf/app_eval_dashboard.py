@@ -998,11 +998,56 @@ def _render_live_evaluation() -> None:
 # TAB 2 — SECTION HEATMAP
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _cell_color(val: Any) -> str:
+    """Return a hex background color based on a 0-100 score."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return "#f3f4f6"  # light grey for missing
+    v = float(val)
+    if v >= 80:
+        return "#86efac"  # green
+    if v >= 50:
+        return "#fde68a"  # yellow
+    return "#fca5a5"      # red
+
+
+def _render_heatmap_html(df: "pd.DataFrame", metric_cols: List[str]) -> None:
+    """Render a color-coded heatmap table using pure HTML — no matplotlib or plotly needed."""
+    rows_html = ""
+    for section, row in df[metric_cols].iterrows():
+        cells = f'<td style="padding:8px 12px;font-weight:600;background:#f8fafc;border:1px solid #e2e8f0;white-space:nowrap;">{section}</td>'
+        for col in metric_cols:
+            val = row[col]
+            bg = _cell_color(val)
+            label = f"{float(val):.1f}" if (val is not None and not (isinstance(val, float) and pd.isna(val))) else "—"
+            cells += (
+                f'<td style="padding:8px 14px;text-align:center;'
+                f'background:{bg};border:1px solid #e2e8f0;">{label}</td>'
+            )
+        rows_html += f"<tr>{cells}</tr>"
+
+    header_cells = '<th style="padding:8px 12px;background:#5340C0;color:white;border:1px solid #4338ca;">Section</th>'
+    for col in metric_cols:
+        header_cells += (
+            f'<th style="padding:8px 14px;background:#5340C0;color:white;'
+            f'text-align:center;border:1px solid #4338ca;">{col}</th>'
+        )
+
+    html = f"""
+    <div style="overflow-x:auto;margin-bottom:16px;">
+      <table style="border-collapse:collapse;width:100%;font-size:14px;font-family:sans-serif;">
+        <thead><tr>{header_cells}</tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+
 def _render_tab_heatmap(runs: List[Dict[str, Any]]) -> None:
     """Multi-metric heatmap (rows=sections, cols=metrics) with detail view."""
 
     if not runs:
-        st.info("No runs available.")
+        st.info("No evaluation runs available. Generate a PMF document first to see results here.")
         return
 
     # Reuse the same run selector
@@ -1014,6 +1059,7 @@ def _render_tab_heatmap(runs: List[Dict[str, Any]]) -> None:
                        format_func=lambda i: labels[i], key="tab2_run_sel")
     run_file = runs[idx].get("run_file", "")
     if not run_file or not os.path.exists(run_file):
+        st.warning(f"Run file not found: {run_file}")
         return
 
     payload = _load_run_payload(run_file)
@@ -1022,7 +1068,7 @@ def _render_tab_heatmap(runs: List[Dict[str, Any]]) -> None:
     run_sections = payload.get("run_artifacts", payload).get("sections", [])
 
     if not sections:
-        st.info("No section data available.")
+        st.warning("No section evaluation data available in this run. Check if the evaluation completed successfully.")
         return
 
     # Build a lookup from section_key to the run_artifacts section
@@ -1051,19 +1097,17 @@ def _render_tab_heatmap(runs: List[Dict[str, Any]]) -> None:
 
     df = pd.DataFrame(heatmap_rows).set_index("Section")
 
-    # Replace None with NaN for Styler
-    df = df.where(df.notna(), other=float("nan"))
-
     metric_cols = ["Rule Score", "Judge Score", "Faithfulness", "Ctx Precision", "RAG Triad"]
+
+    # Ensure all metric columns are numeric (None -> NaN)
+    for col in metric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     st.subheader("Section Heatmap")
     st.caption("Green (>80) | Yellow (50-80) | Red (<50). Blank = metric not computed.")
 
-    styled = df[metric_cols].style.background_gradient(
-        cmap="RdYlGn", vmin=0, vmax=100, axis=None,
-    ).format("{:.1f}", na_rep="—")
-
-    st.dataframe(styled, use_container_width=True, height=min(len(df) * 40 + 60, 600))
+    _render_heatmap_html(df, metric_cols)
 
     # ── Section detail drill-down ────────────────────────────────────────
     st.subheader("Section Detail")
@@ -1133,348 +1177,349 @@ def _safe_pct(val: Any) -> Optional[float]:
 # TAB 3 — TREND ANALYSIS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _render_tab_trends(runs: List[Dict[str, Any]]) -> None:
-    """Time-series charts and regression alerts."""
-
-    if len(runs) < 2:
-        st.info("Need at least 2 runs for trend analysis.")
-        return
-
-    df = pd.DataFrame(runs)
-    df["overall_score"] = pd.to_numeric(df.get("overall_score"), errors="coerce")
-    df = df.sort_values("timestamp").reset_index(drop=True)
-
-    # ── Regression alert ─────────────────────────────────────────────────
-    latest = df.iloc[-1]["overall_score"]
-    prev = df.iloc[-2]["overall_score"]
-    if pd.notna(latest) and pd.notna(prev):
-        drop = prev - latest
-        if drop > 5:
-            latest_ts = df.iloc[-1].get("timestamp", "?")
-            st.markdown(
-                f'<div style="background:{CLR_DANGER};color:white;padding:12px;'
-                f'border-radius:8px;margin-bottom:16px;">'
-                f'<strong>Regression detected:</strong> Rule score dropped from '
-                f'{prev:.1f} to {latest:.1f} (delta {-drop:+.1f}) on {latest_ts}'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-    # ── Composite score over time ────────────────────────────────────────
-    st.subheader("Score Trend Over Time")
-
-    if HAS_PLOTLY:
-        fig = px.line(df, x="timestamp", y="overall_score", markers=True,
-                      labels={"overall_score": "Rule Score (%)", "timestamp": "Run"})
-        fig.update_traces(line_color=CLR_PRIMARY)
-        fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.line_chart(df.set_index("timestamp")["overall_score"])
-
-    # ── Multi-metric trend ───────────────────────────────────────────────
-    # Load extended data from each run payload to build multi-metric trend
-    multi_rows: List[Dict[str, Any]] = []
-    for _, row in df.iterrows():
-        rf = row.get("run_file", "")
-        if rf and os.path.exists(rf):
-            p = _load_run_payload(rf)
-            ext = _extract_extended(p)
-            ed = p.get("evaluation", {}).get("document_scores", {})
-            multi_rows.append({
-                "timestamp": row["timestamp"],
-                "Rule Score": ed.get("overall_score"),
-                "BERTScore F1": _safe_pct(ext.get("mean_bertscore_f1")),
-                "Judge Score": ext.get("mean_judge_normalized"),
-                "Faithfulness": _safe_pct(ext.get("mean_faithfulness")),
-                "RAGAS": _safe_pct(ext.get("mean_ragas")),
-            })
-
-    if multi_rows:
-        mdf = pd.DataFrame(multi_rows).set_index("timestamp")
-        # Only show columns that have at least one non-null value
-        active_cols = [c for c in mdf.columns if mdf[c].notna().any()]
-        if active_cols:
-            st.subheader("Multi-Metric Trend")
-            if HAS_PLOTLY:
-                fig = go.Figure()
-                colors = [CLR_PRIMARY, CLR_SUCCESS, "#3B82F6", CLR_WARNING, CLR_DANGER]
-                for i, col in enumerate(active_cols):
-                    fig.add_trace(go.Scatter(
-                        x=mdf.index, y=mdf[col], name=col, mode="lines+markers",
-                        line=dict(color=colors[i % len(colors)]),
-                    ))
-                fig.update_layout(height=350, margin=dict(l=0, r=0, t=10, b=0),
-                                  yaxis_title="Score (0-100)")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.line_chart(mdf[active_cols])
-
-    # ── Section score distribution (histogram) ───────────────────────────
-    st.subheader("Section Score Distribution (Latest Run)")
-    latest_file = df.iloc[-1].get("run_file", "")
-    if latest_file and os.path.exists(latest_file):
-        lp = _load_run_payload(latest_file)
-        secs = lp.get("evaluation", {}).get("document_scores", {}).get("sections", [])
-        sec_scores = [s.get("score", 0) for s in secs]
-        if sec_scores:
-            if HAS_PLOTLY:
-                fig = px.histogram(
-                    x=sec_scores, nbins=10,
-                    labels={"x": "Section Rule Score", "count": "Count"},
-                    color_discrete_sequence=[CLR_PRIMARY],
-                )
-                fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0))
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                hist_df = pd.DataFrame({"Score": sec_scores})
-                st.bar_chart(hist_df["Score"].value_counts().sort_index())
+# DEPRECATED: Removed from dashboard
+# def _render_tab_trends(runs: List[Dict[str, Any]]) -> None:
+#     """Time-series charts and regression alerts."""
+#
+#     if len(runs) < 2:
+#         st.info("Need at least 2 runs for trend analysis.")
+#         return
+#
+##     df = pd.DataFrame(runs)
+#    df["overall_score"] = pd.to_numeric(df.get("overall_score"), errors="coerce")
+#    df = df.sort_values("timestamp").reset_index(drop=True)
+#
+#    # ── Regression alert ─────────────────────────────────────────────────
+#    latest = df.iloc[-1]["overall_score"]
+#    prev = df.iloc[-2]["overall_score"]
+#    if pd.notna(latest) and pd.notna(prev):
+#        drop = prev - latest
+#        if drop > 5:
+#            latest_ts = df.iloc[-1].get("timestamp", "?")
+#            st.markdown(
+#                f'<div style="background:{CLR_DANGER};color:white;padding:12px;'
+#                f'border-radius:8px;margin-bottom:16px;">'
+#                f'<strong>Regression detected:</strong> Rule score dropped from '
+#                f'{prev:.1f} to {latest:.1f} (delta {-drop:+.1f}) on {latest_ts}'
+#                f'</div>',
+#                unsafe_allow_html=True,
+#            )
+#
+#    # ── Composite score over time ────────────────────────────────────────
+#    st.subheader("Score Trend Over Time")
+#
+#    if HAS_PLOTLY:
+#        fig = px.line(df, x="timestamp", y="overall_score", markers=True,
+#                      labels={"overall_score": "Rule Score (%)", "timestamp": "Run"})
+#        fig.update_traces(line_color=CLR_PRIMARY)
+#        fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0))
+#        st.plotly_chart(fig, use_container_width=True)
+#    else:
+#        st.line_chart(df.set_index("timestamp")["overall_score"])
+#
+#    # ── Multi-metric trend ───────────────────────────────────────────────
+#    # Load extended data from each run payload to build multi-metric trend
+#    multi_rows: List[Dict[str, Any]] = []
+#    for _, row in df.iterrows():
+#        rf = row.get("run_file", "")
+#        if rf and os.path.exists(rf):
+#            p = _load_run_payload(rf)
+#            ext = _extract_extended(p)
+#            ed = p.get("evaluation", {}).get("document_scores", {})
+#            multi_rows.append({
+#                "timestamp": row["timestamp"],
+#                "Rule Score": ed.get("overall_score"),
+#                "BERTScore F1": _safe_pct(ext.get("mean_bertscore_f1")),
+#                "Judge Score": ext.get("mean_judge_normalized"),
+#                "Faithfulness": _safe_pct(ext.get("mean_faithfulness")),
+#                "RAGAS": _safe_pct(ext.get("mean_ragas")),
+#            })
+#
+#    if multi_rows:
+#        mdf = pd.DataFrame(multi_rows).set_index("timestamp")
+#        # Only show columns that have at least one non-null value
+#        active_cols = [c for c in mdf.columns if mdf[c].notna().any()]
+#        if active_cols:
+#            st.subheader("Multi-Metric Trend")
+#            if HAS_PLOTLY:
+#                fig = go.Figure()
+#                colors = [CLR_PRIMARY, CLR_SUCCESS, "#3B82F6", CLR_WARNING, CLR_DANGER]
+#                for i, col in enumerate(active_cols):
+#                    fig.add_trace(go.Scatter(
+#                        x=mdf.index, y=mdf[col], name=col, mode="lines+markers",
+#                        line=dict(color=colors[i % len(colors)]),
+#                    ))
+#                fig.update_layout(height=350, margin=dict(l=0, r=0, t=10, b=0),
+#                                  yaxis_title="Score (0-100)")
+#                st.plotly_chart(fig, use_container_width=True)
+#            else:
+#                st.line_chart(mdf[active_cols])
+#
+#    # ── Section score distribution (histogram) ───────────────────────────
+#    st.subheader("Section Score Distribution (Latest Run)")
+#    latest_file = df.iloc[-1].get("run_file", "")
+#    if latest_file and os.path.exists(latest_file):
+#        lp = _load_run_payload(latest_file)
+#        secs = lp.get("evaluation", {}).get("document_scores", {}).get("sections", [])
+#        sec_scores = [s.get("score", 0) for s in secs]
+#        if sec_scores:
+#            if HAS_PLOTLY:
+#                fig = px.histogram(
+#                    x=sec_scores, nbins=10,
+#                    labels={"x": "Section Rule Score", "count": "Count"},
+#                    color_discrete_sequence=[CLR_PRIMARY],
+#                )
+#                fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0))
+#                st.plotly_chart(fig, use_container_width=True)
+#            else:
+#                hist_df = pd.DataFrame({"Score": sec_scores})
+#                st.bar_chart(hist_df["Score"].value_counts().sort_index())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 4 — MODEL COMPARISON (unchanged from previous)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _render_tab_model_comparison() -> None:
-    """Upload JSON results and compare models."""
-    st.subheader("Model Comparison")
-
-    uploaded = st.file_uploader(
-        "Upload evaluation result JSON files (one per model run)",
-        type=["json"], accept_multiple_files=True, key="mc_upload",
-    )
-    if not uploaded:
-        st.info("Upload two or more JSON result files to compare models.")
-        return
-
-    model_data: List[Dict[str, Any]] = []
-    for f in uploaded:
-        try:
-            data = json.loads(f.read().decode("utf-8"))
-            data["_source_file"] = f.name
-            model_data.append(data)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            st.warning(f"Could not parse {f.name}: {exc}")
-
-    if len(model_data) < 2:
-        st.warning("Upload at least 2 files to compare.")
-        return
-
-    rows: List[Dict[str, Any]] = []
-    for d in model_data:
-        label = d.get("_source_file", "unknown")
-        judge = d.get("judge_scores") or {}
-        rag = d.get("rag_scores") or {}
-        lex = d.get("lexical_scores") or {}
-        sem = d.get("semantic_scores") or {}
-        rows.append({
-            "Model / File": label,
-            "Section": d.get("section_key", "—"),
-            "Composite": d.get("composite_score", 0),
-            "Grade": d.get("grade", "?"),
-            "Rule Score": d.get("rule_score"),
-            "BLEU": lex.get("bleu"),
-            "BERTScore F1": sem.get("bertscore_f1_mean"),
-            "Judge Norm.": judge.get("normalized_score"),
-            "RAGAS": rag.get("ragas_score"),
-        })
-
-    cdf = pd.DataFrame(rows)
-    st.dataframe(
-        cdf.style.background_gradient(subset=["Composite"], cmap="RdYlGn",
-                                       vmin=0, vmax=100),
-        use_container_width=True, hide_index=True,
-    )
-
-    # Radar chart
-    st.subheader("Metric Radar")
-    radar_metrics = ["Rule Score", "BLEU", "BERTScore F1", "Judge Norm.", "RAGAS"]
-    if HAS_PLOTLY:
-        fig = go.Figure()
-        for _, row in cdf.iterrows():
-            vals = []
-            for m in radar_metrics:
-                v = row.get(m)
-                if v is None:
-                    vals.append(0)
-                elif m in ("BERTScore F1", "RAGAS"):
-                    vals.append(float(v) * 100)
-                else:
-                    vals.append(float(v))
-            fig.add_trace(go.Scatterpolar(
-                r=vals + [vals[0]], theta=radar_metrics + [radar_metrics[0]],
-                fill="toself", name=str(row.get("Model / File", "")), opacity=0.6,
-            ))
-        fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
-                          height=400, margin=dict(l=40, r=40, t=20, b=20))
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.bar_chart(cdf[["Model / File"] + radar_metrics].set_index("Model / File"))
-
-    # Cost analysis
-    st.subheader("Cost Analysis")
-    cost_entries: Dict[str, float] = {}
-    cost_cols = st.columns(min(len(model_data), 4))
-    for i, d in enumerate(model_data):
-        label = d.get("_source_file", f"Model {i+1}")
-        with cost_cols[i % len(cost_cols)]:
-            cost = st.number_input(f"Cost ($) — {label}", min_value=0.0,
-                                   value=0.0, step=0.01, key=f"cost_{i}")
-            cost_entries[label] = cost
-
-    if any(c > 0 for c in cost_entries.values()):
-        st.subheader("Pareto Recommendation")
-        pareto_rows = []
-        for _, row in cdf.iterrows():
-            label = row["Model / File"]
-            cost = cost_entries.get(label, 0)
-            comp = row.get("Composite", 0) or 0
-            eff = round(comp / cost, 2) if cost > 0 else 0
-            pareto_rows.append({"Model": label, "Composite": comp,
-                                "Cost ($)": cost, "Score / $": eff})
-        pdf = pd.DataFrame(pareto_rows).sort_values("Score / $", ascending=False)
-        st.dataframe(pdf, use_container_width=True, hide_index=True)
-        best = pdf.iloc[0]
-        st.success(
-            f"Recommended: **{best['Model']}** — "
-            f"Composite {best['Composite']:.1f} at ${best['Cost ($)']:.2f} "
-            f"({best['Score / $']:.1f} points per dollar)"
-        )
+#def _render_tab_model_comparison() -> None:
+#    """Upload JSON results and compare models."""
+#    st.subheader("Model Comparison")
+#
+#    uploaded = st.file_uploader(
+#        "Upload evaluation result JSON files (one per model run)",
+#        type=["json"], accept_multiple_files=True, key="mc_upload",
+#    )
+#    if not uploaded:
+#        st.info("Upload two or more JSON result files to compare models.")
+#        return
+#
+#    model_data: List[Dict[str, Any]] = []
+#    for f in uploaded:
+#        try:
+#            data = json.loads(f.read().decode("utf-8"))
+#            data["_source_file"] = f.name
+#            model_data.append(data)
+#        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+#            st.warning(f"Could not parse {f.name}: {exc}")
+#
+#    if len(model_data) < 2:
+#        st.warning("Upload at least 2 files to compare.")
+#        return
+#
+#    rows: List[Dict[str, Any]] = []
+#    for d in model_data:
+#        label = d.get("_source_file", "unknown")
+#        judge = d.get("judge_scores") or {}
+#        rag = d.get("rag_scores") or {}
+#        lex = d.get("lexical_scores") or {}
+#        sem = d.get("semantic_scores") or {}
+#        rows.append({
+#            "Model / File": label,
+#            "Section": d.get("section_key", "—"),
+#            "Composite": d.get("composite_score", 0),
+#            "Grade": d.get("grade", "?"),
+#            "Rule Score": d.get("rule_score"),
+#            "BLEU": lex.get("bleu"),
+#            "BERTScore F1": sem.get("bertscore_f1_mean"),
+#            "Judge Norm.": judge.get("normalized_score"),
+#            "RAGAS": rag.get("ragas_score"),
+#        })
+#
+#    cdf = pd.DataFrame(rows)
+#    st.dataframe(
+#        cdf.style.background_gradient(subset=["Composite"], cmap="RdYlGn",
+#                                       vmin=0, vmax=100),
+#        use_container_width=True, hide_index=True,
+#    )
+#
+#    # Radar chart
+#    st.subheader("Metric Radar")
+#    radar_metrics = ["Rule Score", "BLEU", "BERTScore F1", "Judge Norm.", "RAGAS"]
+#    if HAS_PLOTLY:
+#        fig = go.Figure()
+#        for _, row in cdf.iterrows():
+#            vals = []
+#            for m in radar_metrics:
+#                v = row.get(m)
+#                if v is None:
+#                    vals.append(0)
+#                elif m in ("BERTScore F1", "RAGAS"):
+#                    vals.append(float(v) * 100)
+#                else:
+#                    vals.append(float(v))
+#            fig.add_trace(go.Scatterpolar(
+#                r=vals + [vals[0]], theta=radar_metrics + [radar_metrics[0]],
+#                fill="toself", name=str(row.get("Model / File", "")), opacity=0.6,
+#            ))
+#        fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+#                          height=400, margin=dict(l=40, r=40, t=20, b=20))
+#        st.plotly_chart(fig, use_container_width=True)
+#    else:
+#        st.bar_chart(cdf[["Model / File"] + radar_metrics].set_index("Model / File"))
+#
+#    # Cost analysis
+#    st.subheader("Cost Analysis")
+#    cost_entries: Dict[str, float] = {}
+#    cost_cols = st.columns(min(len(model_data), 4))
+#    for i, d in enumerate(model_data):
+#        label = d.get("_source_file", f"Model {i+1}")
+#        with cost_cols[i % len(cost_cols)]:
+#            cost = st.number_input(f"Cost ($) — {label}", min_value=0.0,
+#                                   value=0.0, step=0.01, key=f"cost_{i}")
+#            cost_entries[label] = cost
+#
+#    if any(c > 0 for c in cost_entries.values()):
+#        st.subheader("Pareto Recommendation")
+#        pareto_rows = []
+#        for _, row in cdf.iterrows():
+#            label = row["Model / File"]
+#            cost = cost_entries.get(label, 0)
+#            comp = row.get("Composite", 0) or 0
+#            eff = round(comp / cost, 2) if cost > 0 else 0
+#            pareto_rows.append({"Model": label, "Composite": comp,
+#                                "Cost ($)": cost, "Score / $": eff})
+#        pdf = pd.DataFrame(pareto_rows).sort_values("Score / $", ascending=False)
+#        st.dataframe(pdf, use_container_width=True, hide_index=True)
+#        best = pdf.iloc[0]
+#        st.success(
+#            f"Recommended: **{best['Model']}** — "
+#            f"Composite {best['Composite']:.1f} at ${best['Cost ($)']:.2f} "
+#            f"({best['Score / $']:.1f} points per dollar)"
+#        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 5 — BENCHMARK MANAGEMENT (unchanged from previous)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _render_tab_benchmark() -> None:
-    """Benchmark management interface."""
-    if not HAS_BENCHMARK:
-        st.info("Benchmark loader not available.")
-        return
-
-    st.subheader("Benchmark Management")
-    loader = BenchmarkLoader(BENCHMARK_DIR)
-    stats = loader.get_statistics()
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Cases", stats.get("total_cases", 0))
-    c2.metric("With Reference", stats.get("cases_with_reference", 0))
-    c3.metric("Expert Annotated", stats.get("cases_with_expert_scores", 0))
-    c4.metric("Auto Scored", stats.get("cases_with_automated_scores", 0))
-
-    # Filterable table
-    st.subheader("Browse Cases")
-    fc1, fc2, fc3 = st.columns(3)
-    with fc1:
-        ft = st.selectbox("Section Type",
-                          ["All"] + list(stats.get("by_section_type", {}).keys()),
-                          key="bm_ft")
-    with fc2:
-        fd = st.selectbox("Difficulty",
-                          ["All"] + list(stats.get("by_difficulty", {}).keys()),
-                          key="bm_fd")
-    with fc3:
-        fs = st.text_input("Search section key", "", key="bm_fs")
-
-    filters: Dict[str, Any] = {}
-    if ft != "All":
-        filters["section_type"] = ft
-    if fd != "All":
-        filters["difficulty"] = fd
-    if fs.strip():
-        filters["section_key"] = fs.strip()
-
-    cases = loader.load_cases(filters if filters else None)
-    if cases:
-        rows = [{
-            "Case ID": c.get("case_id", ""),
-            "Section": c.get("section_key", ""),
-            "Site": c.get("site_name", ""),
-            "Type": c.get("section_type", ""),
-            "Difficulty": c.get("difficulty", ""),
-            "Ref Len": len(c.get("reference_output", "")),
-            "Tags": ", ".join(c.get("tags", [])),
-        } for c in cases]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    else:
-        st.info("No cases match filters.")
-
-    # Add case form
-    st.subheader("Add New Case")
-    with st.expander("New benchmark case form"):
-        nsk = st.text_input("Section Key", key="bn_sk")
-        nsite = st.text_input("Site Name", key="bn_site")
-        ninstr = st.text_area("Section Instruction", height=80, key="bn_instr")
-        nquery = st.text_input("Retrieval Query", key="bn_query")
-        nref = st.text_area("Reference Output", height=120, key="bn_ref")
-        ntype = st.selectbox("Type", ["text", "table", "image", "static"], key="bn_type")
-        ndiff = st.selectbox("Difficulty", ["easy", "medium", "hard"], key="bn_diff")
-        ntags = st.text_input("Tags (comma-separated)", key="bn_tags")
-        if st.button("Add Case", key="bn_add"):
-            if not nsk.strip() or not nref.strip():
-                st.warning("Section Key and Reference Output are required.")
-            else:
-                new_case: Dict[str, Any] = {
-                    "created_at": datetime.now().isoformat(),
-                    "created_by": "human", "validated_by": None,
-                    "site_name": nsite, "section_key": nsk,
-                    "section_instruction": ninstr, "retrieval_query": nquery,
-                    "source_documents": [], "retrieved_context": "",
-                    "generated_output": {}, "reference_output": nref,
-                    "expert_scores": {}, "automated_scores": {},
-                    "tags": [t.strip() for t in ntags.split(",") if t.strip()],
-                    "difficulty": ndiff, "section_type": ntype,
-                }
-                try:
-                    cid = loader.add_case(new_case, validate=True)
-                    st.success(f"Case **{cid}** added.")
-                except ValueError as exc:
-                    st.error(f"Validation failed: {exc}")
-
-    # Export + Run
-    st.subheader("Export & Run")
-    ec1, ec2 = st.columns(2)
-    with ec1:
-        if st.button("Export to CSV", key="bn_csv"):
-            csv_path = os.path.join(BENCHMARK_DIR, "benchmark_export.csv")
-            loader.export_to_csv(csv_path)
-            st.success(f"Exported to `{csv_path}`")
-            with open(csv_path, "r", encoding="utf-8") as fh:
-                st.download_button("Download CSV", fh.read(),
-                                   file_name="benchmark_export.csv",
-                                   mime="text/csv", key="bn_dl")
-    with ec2:
-        do_run = st.button("Run Full Benchmark", key="bn_run")
-    if do_run:
-        all_cases = loader.load_cases()
-        if not all_cases:
-            st.warning("No cases.")
-            return
-        try:
-            from healthark_eval import EvalSuite
-        except ImportError:
-            st.error("healthark_eval not available.")
-            return
-        suite = EvalSuite(task="pmf", run_judge=False, run_rag=False,
-                          run_semantic=False)
-        prog = st.progress(0, text="Evaluating...")
-        res: List[Dict[str, Any]] = []
-        for i, case in enumerate(all_cases):
-            ref = case.get("reference_output", "")
-            r = suite.run(generated=ref, reference=ref,
-                          section_key=case.get("section_key", ""),
-                          section_instruction=case.get("section_instruction", ""),
-                          site_name=case.get("site_name", ""))
-            res.append({"Case ID": case.get("case_id"), "Section": case.get("section_key"),
-                         "Composite": r.composite_score, "Grade": r.grade,
-                         "Rule Score": r.rule_score})
-            prog.progress((i + 1) / len(all_cases),
-                          text=f"Evaluated {i+1}/{len(all_cases)}...")
-        prog.empty()
-        st.success(f"Benchmark complete: {len(res)} cases.")
-        rdf = pd.DataFrame(res)
-        st.dataframe(rdf, use_container_width=True, hide_index=True)
-        st.metric("Mean Composite", f"{rdf['Composite'].mean():.1f}")
+#def _render_tab_benchmark() -> None:
+#    """Benchmark management interface."""
+#    if not HAS_BENCHMARK:
+#        st.info("Benchmark loader not available.")
+#        return
+#
+#    st.subheader("Benchmark Management")
+#    loader = BenchmarkLoader(BENCHMARK_DIR)
+#    stats = loader.get_statistics()
+#
+#    c1, c2, c3, c4 = st.columns(4)
+#    c1.metric("Total Cases", stats.get("total_cases", 0))
+#    c2.metric("With Reference", stats.get("cases_with_reference", 0))
+#    c3.metric("Expert Annotated", stats.get("cases_with_expert_scores", 0))
+#    c4.metric("Auto Scored", stats.get("cases_with_automated_scores", 0))
+#
+#    # Filterable table
+#    st.subheader("Browse Cases")
+#    fc1, fc2, fc3 = st.columns(3)
+#    with fc1:
+#        ft = st.selectbox("Section Type",
+#                          ["All"] + list(stats.get("by_section_type", {}).keys()),
+#                          key="bm_ft")
+#    with fc2:
+#        fd = st.selectbox("Difficulty",
+#                          ["All"] + list(stats.get("by_difficulty", {}).keys()),
+#                          key="bm_fd")
+#    with fc3:
+#        fs = st.text_input("Search section key", "", key="bm_fs")
+#
+#    filters: Dict[str, Any] = {}
+#    if ft != "All":
+#        filters["section_type"] = ft
+#    if fd != "All":
+#        filters["difficulty"] = fd
+#    if fs.strip():
+#        filters["section_key"] = fs.strip()
+#
+#    cases = loader.load_cases(filters if filters else None)
+#    if cases:
+#        rows = [{
+#            "Case ID": c.get("case_id", ""),
+#            "Section": c.get("section_key", ""),
+#            "Site": c.get("site_name", ""),
+#            "Type": c.get("section_type", ""),
+#            "Difficulty": c.get("difficulty", ""),
+#            "Ref Len": len(c.get("reference_output", "")),
+#            "Tags": ", ".join(c.get("tags", [])),
+#        } for c in cases]
+#        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+#    else:
+#        st.info("No cases match filters.")
+#
+#    # Add case form
+#    st.subheader("Add New Case")
+#    with st.expander("New benchmark case form"):
+#        nsk = st.text_input("Section Key", key="bn_sk")
+#        nsite = st.text_input("Site Name", key="bn_site")
+#        ninstr = st.text_area("Section Instruction", height=80, key="bn_instr")
+#        nquery = st.text_input("Retrieval Query", key="bn_query")
+#        nref = st.text_area("Reference Output", height=120, key="bn_ref")
+#        ntype = st.selectbox("Type", ["text", "table", "image", "static"], key="bn_type")
+#        ndiff = st.selectbox("Difficulty", ["easy", "medium", "hard"], key="bn_diff")
+#        ntags = st.text_input("Tags (comma-separated)", key="bn_tags")
+#        if st.button("Add Case", key="bn_add"):
+#            if not nsk.strip() or not nref.strip():
+#                st.warning("Section Key and Reference Output are required.")
+#            else:
+#                new_case: Dict[str, Any] = {
+#                    "created_at": datetime.now().isoformat(),
+#                    "created_by": "human", "validated_by": None,
+#                    "site_name": nsite, "section_key": nsk,
+#                    "section_instruction": ninstr, "retrieval_query": nquery,
+#                    "source_documents": [], "retrieved_context": "",
+#                    "generated_output": {}, "reference_output": nref,
+#                    "expert_scores": {}, "automated_scores": {},
+#                    "tags": [t.strip() for t in ntags.split(",") if t.strip()],
+#                    "difficulty": ndiff, "section_type": ntype,
+#                }
+#                try:
+#                    cid = loader.add_case(new_case, validate=True)
+#                    st.success(f"Case **{cid}** added.")
+#                except ValueError as exc:
+#                    st.error(f"Validation failed: {exc}")
+#
+#    # Export + Run
+#    st.subheader("Export & Run")
+#    ec1, ec2 = st.columns(2)
+#    with ec1:
+#        if st.button("Export to CSV", key="bn_csv"):
+#            csv_path = os.path.join(BENCHMARK_DIR, "benchmark_export.csv")
+#            loader.export_to_csv(csv_path)
+#            st.success(f"Exported to `{csv_path}`")
+#            with open(csv_path, "r", encoding="utf-8") as fh:
+#                st.download_button("Download CSV", fh.read(),
+#                                   file_name="benchmark_export.csv",
+#                                   mime="text/csv", key="bn_dl")
+#    with ec2:
+#        do_run = st.button("Run Full Benchmark", key="bn_run")
+#    if do_run:
+#        all_cases = loader.load_cases()
+#        if not all_cases:
+#            st.warning("No cases.")
+#            return
+#        try:
+#            from healthark_eval import EvalSuite
+#        except ImportError:
+#            st.error("healthark_eval not available.")
+#            return
+#        suite = EvalSuite(task="pmf", run_judge=False, run_rag=False,
+#                          run_semantic=False)
+#        prog = st.progress(0, text="Evaluating...")
+#        res: List[Dict[str, Any]] = []
+#        for i, case in enumerate(all_cases):
+#            ref = case.get("reference_output", "")
+#            r = suite.run(generated=ref, reference=ref,
+#                          section_key=case.get("section_key", ""),
+#                          section_instruction=case.get("section_instruction", ""),
+#                          site_name=case.get("site_name", ""))
+#            res.append({"Case ID": case.get("case_id"), "Section": case.get("section_key"),
+#                         "Composite": r.composite_score, "Grade": r.grade,
+#                         "Rule Score": r.rule_score})
+#            prog.progress((i + 1) / len(all_cases),
+#                          text=f"Evaluated {i+1}/{len(all_cases)}...")
+#        prog.empty()
+#        st.success(f"Benchmark complete: {len(res)} cases.")
+#        rdf = pd.DataFrame(res)
+#        st.dataframe(rdf, use_container_width=True, hide_index=True)
+#        st.metric("Mean Composite", f"{rdf['Composite'].mean():.1f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1728,9 +1773,8 @@ def render_eval_dashboard() -> None:
 
     runs = _load_runs()
 
-    t1, t2, t3, t4, t5, t6 = st.tabs([
-        "Run Overview", "Section Heatmap", "Trend Analysis",
-        "Model Comparison", "Benchmark Management", "⚡ Performance",
+    t1, t2, t3 = st.tabs([
+        "Run Overview", "Section Heatmap", "⚡ Performance",
     ])
 
     with t1:
@@ -1738,12 +1782,6 @@ def render_eval_dashboard() -> None:
     with t2:
         _render_tab_heatmap(runs)
     with t3:
-        _render_tab_trends(runs)
-    with t4:
-        _render_tab_model_comparison()
-    with t5:
-        _render_tab_benchmark()
-    with t6:
         _render_tab_performance(runs)
 
 

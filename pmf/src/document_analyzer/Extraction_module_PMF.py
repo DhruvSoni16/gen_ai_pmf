@@ -1,13 +1,8 @@
 import io
 import os
-import re
-import shutil
 import time
 import logging
 from docx import Document
-import json
-import pandas as pd
-from io import StringIO
 import streamlit as st
 from datetime import datetime
 from docxcompose.composer import Composer
@@ -16,17 +11,13 @@ from langchain_openai import AzureChatOpenAI
 from openai import AzureOpenAI
 
 from src.document_generate.dynamic_template_PMF import handle_user_message
-from src.document_ingestion.data_collection import data_extraction,convert_all_doc_to_docx_in_folder,extract_text_from_xlsx
+from src.document_ingestion.data_collection import data_extraction, convert_all_doc_to_docx_in_folder, extract_text_from_xlsx
 from src.document_analyzer.json_converter import extract_text_from_word
-from src.document_generate.Assembling_appendix_PMF import assemble_appendices,convert_word_to_pdf
-from src.document_analyzer.contents import refresh_toc_with_word,extract_headings_with_tables
+from src.document_analyzer.contents import refresh_toc_with_word, extract_headings_with_tables
 from src.document_retriever.Vector_db import DocumentRetriever
 from src.eval.eval_config import get_eval_rules
 from src.eval.eval_utils import evaluate_run
 from src.eval.eval_store import save_eval_run
-from src.eval.eval_metrics import compute_all_metrics
-from src.eval.eval_judge import PMFJudge
-from src.eval.eval_rag import RAGEvaluator
 from healthark_eval.suite import EvalSuite
 
 
@@ -50,7 +41,7 @@ def _derive_section_title(key: str, value: str) -> str:
 def Template_to_list(text):
     if text is None:
         return [], []     # Handle the case where text is None by returning empty lists
-    
+
     sections = [section.strip() for section in text.split('$') if section.strip()]
     split_index = None
     for i, item in enumerate(sections):
@@ -295,238 +286,177 @@ def _run_extended_evaluation(run_artifacts, eval_suite):
     )
 
 
-def extraction_pmf(template_file_path):
+# ── extraction_pmf helpers ────────────────────────────────────────────────────
 
+def _init_azure_clients():
+    """Load env vars and initialise the LangChain LLM + raw OpenAI client."""
     load_dotenv()
-    AZURE_KEY = os.getenv('AZURE_KEY', '')
-    AZURE_ENDPOINT = os.getenv('AZURE_ENDPOINT', '')
-    AZURE_NAME = os.getenv('AZURE_NAME', '')
-    AZURE_VERSION = os.getenv('AZURE_VERSION', '')
-
+    key = os.getenv('AZURE_KEY', '')
+    endpoint = os.getenv('AZURE_ENDPOINT', '')
+    name = os.getenv('AZURE_NAME', '')
+    version = os.getenv('AZURE_VERSION', '')
     llm = None
     client = None
     try:
         llm = AzureChatOpenAI(
-            azure_deployment=AZURE_NAME,
-            api_key=AZURE_KEY,
-            azure_endpoint=AZURE_ENDPOINT,
-            api_version=AZURE_VERSION,
+            azure_deployment=name,
+            api_key=key,
+            azure_endpoint=endpoint,
+            api_version=version,
             temperature=0.1,
         )
-
         client = AzureOpenAI(
-        api_key=AZURE_KEY,  
-        api_version=AZURE_VERSION,
-        azure_endpoint=AZURE_ENDPOINT,
-)
+            api_key=key,
+            api_version=version,
+            azure_endpoint=endpoint,
+        )
     except Exception as e:
         print("Failed to initialize AzureChatOpenAI!")
         print("Error:", e)
+    return llm, client, key, endpoint, name, version
 
 
-                
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_artifacts = {
-        "timestamp": timestamp,
-        "template_file": template_file_path,
-        "site_name": st.session_state.get("SiteName", ""),
-        "model_name": AZURE_NAME,
-        "sections": [],
-    }
-    
+def _resolve_base_folder():
+    """Return the extraction base folder, descending into the first subfolder."""
+    base = "data/artifacts/Extracted_folder"
+    folders = [f for f in os.listdir(base) if os.path.isdir(os.path.join(base, f))]
+    st.write(folders)
+    if folders:
+        return f"{base}/{folders[0]}"
+    return base
 
- 
-   
-    # ------------------------------------- Devide json into 2 Part--------------------------------------------------------------------------------------------
-    
-    template_content = extract_text_from_word(template_file_path)
-    part1,part2=Template_to_list(template_content)
-    template_json=convert_dict(part1)
-    
-                    
-#--------------------------------------------------------------------------------------------------------------  
-    
-    # Output doc with footer header
-    template_path_1 = fr"templates\\output_template_1.docx"
-    template_path = fr"templates\\output_template_PMF.docx"
-    # Create a new file name
-    new_file_name = fr"PMF_Output_{timestamp}.docx"
-    new_file_name_pdf = fr"PMF_Output_{timestamp}.pdf"
-    
-    
-    
+
+def _load_template_docs(site_name, timestamp):
+    """Load cover + body docx templates and personalise [Site Name] placeholders."""
+    template_path_1 = r"templates\\output_template_1.docx"
+    template_path = r"templates\\output_template_PMF.docx"
+    new_file_name = f"PMF_Output_{timestamp}.docx"
+    new_file_name_pdf = f"PMF_Output_{timestamp}.pdf"
+
     first_doc = Document(template_path)
     for paragraph in first_doc.paragraphs:
         for run in paragraph.runs:
             if "[Site Name]" in run.text:
-                # Replace the text
-                run.text = run.text.replace("[Site Name]", st.session_state.SiteName)
-                # Make the replaced text bold
+                run.text = run.text.replace("[Site Name]", site_name)
                 run.bold = True
-    
-    
+
     doc = Document(template_path_1)
-
-   
-
-
-    
-    
-
-# --------------------------------Iterate over after executive Summary--------------------------------------------------------------------
-    doc_1=doc
-    
-    base_folder = fr"data/artifacts/Extracted_folder"
-    folders = [f for f in os.listdir(base_folder) if os.path.isdir(os.path.join(base_folder, f))]
-    st.write(folders)
-    if len(folders)<1:
-        base_folder = rf"data/artifacts/Extracted_folder"
-    else:
-        base_folder = rf"data/artifacts/Extracted_folder/{folders[0]}"
+    return first_doc, doc, new_file_name, new_file_name_pdf
 
 
-    # convert all doc files to docx in the folder
-    convert_all_doc_to_docx_in_folder(base_folder) 
+def _retrieve_context(retriever, key, value_ls, data_as_string, base_folder):
+    """Retrieve relevant document chunks for one template section."""
+    input_text = ""
+    paths = []
+    ret_ms = None
 
-    # Initialize the DocumentRetriever with the base folder and store the vector database in the specified path
-    retriever = DocumentRetriever(base_folder)
-    retriever.process_documents()
-    
-    st.write("Extracting text from documents...")
-    _pipeline_start = time.perf_counter()
+    if len(value_ls) > 1:
+        t0 = time.perf_counter()
+        results = retriever.search(value_ls[1], top_k=8)
+        ret_ms = (time.perf_counter() - t0) * 1000
+
+        # Filter out low-relevance results; fall back to top-3 if all filtered
+        MAX_DISTANCE = 0.85
+        paths = [path for path, _, score in results if score <= MAX_DISTANCE]
+        if not paths:
+            paths = [r[0] for r in results[:3]]
+
+        input_text += "excel data:\n" + data_as_string + "\n\n########################################\n\n"
+        input_text += data_extraction(paths)
+        st.write("-" * 125)
+    elif "static" not in key.lower():
+        input_text += "excel data:\n" + data_as_string + "\n\n########################################\n\n"
+        input_text += data_extraction([base_folder])
+
+    return input_text, paths, ret_ms
 
 
-    # Check if the uploaded file is a CSV or Excel file and read it into a DataFrame
-    data_as_string = ""
-    if st.session_state.uploaded_excel is not None:
-   
-        data_as_string = extract_text_from_xlsx(st.session_state.uploaded_excel)
+def _build_section_record(key, value_ls, value, paths, input_text, response_data, sec_start, ret_ms, gen_ms):
+    """Build the success artifact dict for one processed section."""
+    display_key = _derive_section_title(key, value_ls[0] if value_ls else value)
+    return {
+        "section_key": display_key,
+        "template_key": key,
+        "prompt_text": value_ls[0] if len(value_ls) > 0 else "",
+        "retrieval_query": value_ls[1] if len(value_ls) > 1 else "",
+        "retrieved_paths": paths,
+        "input_text_size": len(input_text or ""),
+        "is_static": "static" in key.lower(),
+        "agent_result": response_data,
+        "generated_text": (response_data or {}).get("result", {}).get("generated_text", ""),
+        "timing": {
+            "retrieval_ms": round(ret_ms, 1) if ret_ms is not None else None,
+            "generation_ms": round(gen_ms, 1) if gen_ms is not None else None,
+            "eval_ms": None,
+            "total_ms": round((time.perf_counter() - sec_start) * 1000, 1),
+        },
+    }
 
-        st.write(data_as_string)
-    
+
+def _build_error_section_record(key, value_ls, value, sec_start, ret_ms, gen_ms, error):
+    """Build the error artifact dict when section processing fails."""
+    display_key = _derive_section_title(key, value_ls[0] if value_ls else value)
+    return {
+        "section_key": display_key,
+        "template_key": key,
+        "prompt_text": value_ls[0] if len(value_ls) > 0 else "",
+        "retrieval_query": value_ls[1] if len(value_ls) > 1 else "",
+        "retrieved_paths": [],
+        "input_text_size": 0,
+        "is_static": "static" in key.lower(),
+        "agent_result": None,
+        "generated_text": "",
+        "generation_error": str(error),
+        "timing": {
+            "retrieval_ms": round(ret_ms, 1) if ret_ms is not None else None,
+            "generation_ms": round(gen_ms, 1) if gen_ms is not None else None,
+            "eval_ms": None,
+            "total_ms": round((time.perf_counter() - sec_start) * 1000, 1),
+        },
+    }
 
 
+def _process_one_section(llm, client, key, value, doc_1, retriever, data_as_string, base_folder, input_file_path):
+    """Run retrieval + generation for a single template section."""
+    value = value.replace("[Site Name]", st.session_state.SiteName)
+    value_ls = value.split('@!')
 
-    # TEST MODE: limit to first 5 sections for fast iteration — remove this line for full runs
-    template_json = dict(list(template_json.items())[:5])
+    flag = 1
+    index = 1
+    st.write(key)
+    st.write(value[:80])
+    st.write("")
+    st.write("")
 
-    for key,value in template_json.items():
-       
-        value = value.replace("[Site Name]", st.session_state.SiteName)
-        value_ls= value.split('@!')
-        
-        flag=1
-        index=1
-        
-        st.write(key)
-        first_25 = value[:80]
-        st.write(first_25)
-        input_file_path=''
-        st.write("")
-        st.write("")
+    sec_start = time.perf_counter()
+    ret_ms = None
+    gen_ms = None
 
-        section_json={key:value}
-        _sec_start = time.perf_counter()
-        _ret_ms = None
-        _gen_ms = None
-        try:
+    try:
+        input_text, paths, ret_ms = _retrieve_context(retriever, key, value_ls, data_as_string, base_folder)
 
-            input_file_text=""
-            paths = []
-            # Retrive the documents name from the vector database
-            if len(value_ls)>1:
-                st.write(value_ls[1])
-                _ret_t0 = time.perf_counter()
-                results = retriever.search(value_ls[1], top_k=5)
-                _ret_ms = (time.perf_counter() - _ret_t0) * 1000
-
-                for i, (path, filename, score) in enumerate(results):
-                    paths.append(path)
-                st.write("Retrieved documents:")
-                st.write(paths)
-                    
-                input_file_text +="excel data:\n" + data_as_string + "\n\n"+ "########################################\n\n"
-                input_file_text += data_extraction(paths)
-
-                st.write("-----------------------------------------------------------------------------------------------------------------------------")
-              
-            elif "static" not in key.lower(): 
-                base_folder_ls=[base_folder]
-
-                input_file_text +="excel data:\n" + data_as_string + "\n\n"+ "########################################\n\n"
-                input_file_text += data_extraction(base_folder_ls)
-            
-            
-
-            # try:   
-            if "static" not in key.lower():
-                _gen_t0 = time.perf_counter()
-                response_data = handle_user_message(llm,client,key,value_ls[0],doc_1,flag,index,input_file_text,input_file_path)
-                _gen_ms = (time.perf_counter() - _gen_t0) * 1000
-            else:
-                _gen_t0 = time.perf_counter()
-                response_data = handle_user_message(llm,client,key,value_ls[0],doc_1,flag,index)
-                _gen_ms = (time.perf_counter() - _gen_t0) * 1000
-
-            # Use a meaningful title derived from the section value instead of
-            # the template type-prefix key ("Text: -", "Static_text:-", etc.)
-            display_key = _derive_section_title(key, value_ls[0] if value_ls else value)
-
-            run_artifacts["sections"].append(
-                {
-                    "section_key": display_key,
-                    "template_key": key,          # original type prefix kept for debugging
-                    "prompt_text": value_ls[0] if len(value_ls) > 0 else "",
-                    "retrieval_query": value_ls[1] if len(value_ls) > 1 else "",
-                    "retrieved_paths": paths,
-                    "input_text_size": len(input_file_text or ""),
-                    "is_static": "static" in key.lower(),
-                    "agent_result": response_data,
-                    "generated_text": (response_data or {}).get("result", {}).get("generated_text", ""),
-                    "timing": {
-                        "retrieval_ms": round(_ret_ms, 1) if _ret_ms is not None else None,
-                        "generation_ms": round(_gen_ms, 1) if _gen_ms is not None else None,
-                        "eval_ms": None,
-                        "total_ms": round((time.perf_counter() - _sec_start) * 1000, 1),
-                    },
-                }
+        gen_t0 = time.perf_counter()
+        if "static" not in key.lower():
+            response_data = handle_user_message(
+                llm, client, key, value_ls[0], doc_1, flag, index, input_text, input_file_path
             )
-        except Exception as e:
-            st.write("Error in processing the section:")
-            st.write(f"An error occurred: {e}")
-            _sec_err_ms = round((time.perf_counter() - _sec_start) * 1000, 1)
-            run_artifacts["sections"].append({
-                "section_key": _derive_section_title(key, value_ls[0] if value_ls else value),
-                "template_key": key,
-                "prompt_text": value_ls[0] if len(value_ls) > 0 else "",
-                "retrieval_query": value_ls[1] if len(value_ls) > 1 else "",
-                "retrieved_paths": [],
-                "input_text_size": 0,
-                "is_static": "static" in key.lower(),
-                "agent_result": None,
-                "generated_text": "",
-                "generation_error": str(e),
-                "timing": {
-                    "retrieval_ms": round(_ret_ms, 1) if _ret_ms is not None else None,
-                    "generation_ms": round(_gen_ms, 1) if _gen_ms is not None else None,
-                    "eval_ms": None,
-                    "total_ms": _sec_err_ms,
-                },
-            })
-            continue
-                
-           
-            st.write("----------------------------------------------------------------------------------------------------------------------------")    
+        else:
+            response_data = handle_user_message(llm, client, key, value_ls[0], doc_1, flag, index)
+        gen_ms = (time.perf_counter() - gen_t0) * 1000
 
-         
+        return _build_section_record(key, value_ls, value, paths, input_text, response_data, sec_start, ret_ms, gen_ms)
 
-   
+    except Exception as e:
+        st.write("Error in processing the section:")
+        st.write(f"An error occurred: {e}")
+        return _build_error_section_record(key, value_ls, value, sec_start, ret_ms, gen_ms, e)
 
-    # Store overall pipeline timing (generation phase only; eval_ms added later)
-    _generation_phase_ms = round((time.perf_counter() - _pipeline_start) * 1000, 1)
-    run_artifacts["timing"] = {
-        "generation_phase_ms": _generation_phase_ms,
-        "total_pipeline_ms": None,   # updated after eval completes
+
+def _compute_pipeline_timing(run_artifacts, pipeline_start):
+    """Aggregate generation-phase timing across all sections."""
+    return {
+        "generation_phase_ms": round((time.perf_counter() - pipeline_start) * 1000, 1),
+        "total_pipeline_ms": None,
         "total_generation_ms": round(sum(
             (s.get("timing") or {}).get("generation_ms") or 0
             for s in run_artifacts["sections"]
@@ -535,67 +465,62 @@ def extraction_pmf(template_file_path):
             (s.get("timing") or {}).get("retrieval_ms") or 0
             for s in run_artifacts["sections"]
         ), 1),
-        "total_eval_ms": None,       # filled by _run_extended_evaluation
+        "total_eval_ms": None,
     }
 
-    # Save the document to a new file----------------------------------------------------------------------------------------------------
-    new_file_path = fr"data/artifacts/generated output file\\{new_file_name}" 
-    new_file_path_temp =rf"data/artifacts/generated output file\Temp_{new_file_name}"
-    final_document_doc = rf"data/artifacts/generated output file\\Final_{new_file_name}"
-    new_file_path_pdf =rf"data/artifacts/generated output file\\{new_file_name_pdf}"
-    final_document = fr"data/artifacts/generated output file\\Final_{new_file_name_pdf}" 
 
-    
+def _assemble_document(doc_1, first_doc, output_dir, new_file_name, new_file_name_pdf):
+    """Save body doc, inject TOC, prepend cover page, return BytesIO + paths."""
+    new_file_path_temp = os.path.join(output_dir, f"Temp_{new_file_name}")
+    final_document_doc = os.path.join(output_dir, f"Final_{new_file_name}")
+    final_document = os.path.join(output_dir, f"Final_{new_file_name_pdf}")
 
-    # Generated file save in doc
     composer = Composer(doc_1)
     composer.save(new_file_path_temp)
 
+    extract_headings_with_tables(new_file_path_temp, 0, final_document_doc)
+    refresh_toc_with_word(os.path.abspath(final_document_doc))
 
-    # add Content to the document
-    doc_t=extract_headings_with_tables(new_file_path_temp,0, final_document_doc)
-    file_path_abs = os.path.abspath(final_document_doc) 
-    refresh_toc_with_word(file_path_abs)
-
-    
-    # Add cover page to the document
     doc1 = Document(final_document_doc)
     composer1 = Composer(first_doc)
     composer1.append(doc1)
     composer1.save(new_file_path_temp)
-    file_path_abs = os.path.abspath(new_file_path_temp)
 
-    # create a link to the document
     link_doc = Document(new_file_path_temp)
     output = io.BytesIO()
     link_doc.save(output)
-    output.seek(0)  
+    output.seek(0)
 
-    run_artifacts["final_doc_path"] = new_file_path_temp
+    return output, new_file_path_temp, final_document
+
+
+def _run_rule_evaluation(run_artifacts):
+    """Run rule-based evaluation and persist results to session state."""
     rules = get_eval_rules()
     evaluation = evaluate_run(run_artifacts, rules)
     eval_file = save_eval_run(run_artifacts, evaluation)
     st.session_state["last_eval_file"] = eval_file
     st.session_state["last_eval_score"] = evaluation.get("document_scores", {}).get("overall_score")
 
-    # Always run extended evaluation using the Azure credentials already in .env.
-    # No checkbox needed — Judge + DeepEval RAG Triad run automatically after generation.
+
+def _run_extended_eval_suite(run_artifacts, azure_name, azure_key, azure_endpoint, azure_version):
+    """Run EvalSuite (Judge + RAG Triad) and persist results to session state."""
     try:
         eval_suite = EvalSuite(
             task="pmf",
             llm_provider="azure_openai",
-            llm_model=AZURE_NAME,
-            api_key=AZURE_KEY,
-            azure_endpoint=AZURE_ENDPOINT,
-            azure_api_version=AZURE_VERSION,
+            llm_model=azure_name,
+            api_key=azure_key,
+            azure_endpoint=azure_endpoint,
+            azure_api_version=azure_version,
             run_judge=True,
             run_rag=True,
             run_semantic=False,   # BERTScore skipped — torch DLL issue on Windows
             run_lexical=False,    # No reference text available during generation
         )
-        run_artifacts["_azure_key"] = AZURE_KEY
-        run_artifacts["_azure_endpoint"] = AZURE_ENDPOINT
-        run_artifacts["_azure_version"] = AZURE_VERSION
+        run_artifacts["_azure_key"] = azure_key
+        run_artifacts["_azure_endpoint"] = azure_endpoint
+        run_artifacts["_azure_version"] = azure_version
         _run_extended_evaluation(run_artifacts, eval_suite)
         ext = run_artifacts.get("extended_eval_summary", {})
         st.session_state["last_extended_composite"] = ext.get("mean_composite", 0)
@@ -604,49 +529,65 @@ def extraction_pmf(template_file_path):
         st.session_state["last_extended_rag"] = ext.get("mean_rag_triad_score")
         st.session_state["last_mlflow_run_id"] = run_artifacts.get("mlflow_run_id")
         st.session_state["last_mlflow_url"] = run_artifacts.get("mlflow_ui_url", "http://localhost:5000")
-    except Exception as _ext_exc:
-        logging.warning("Extended evaluation failed: %s", _ext_exc)
-    
-
-   
+    except Exception as exc:
+        logging.warning("Extended evaluation failed: %s", exc)
 
 
+# ── Main orchestrator ─────────────────────────────────────────────────────────
 
-  
+def extraction_pmf(template_file_path):
+    llm, client, azure_key, azure_endpoint, azure_name, azure_version = _init_azure_clients()
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    site_name = st.session_state.get("SiteName", "")
 
-# #------------------------Appendices assembling---------------------------------------------------------
-    
-    # # Define the base folder path
-    # base_folder = r"data/artifacts/Extracted_folder"
-    # folders = [f for f in os.listdir(base_folder) if os.path.isdir(os.path.join(base_folder, f))]
-    # if len(folders)<1:
-    #     base_folder = rf"data/artifacts/Extracted_folder"
-    # else:
-    #     base_folder = rf"data/artifacts/Extracted_folder/{folders[0]}"
+    run_artifacts = {
+        "timestamp": timestamp,
+        "template_file": template_file_path,
+        "site_name": site_name,
+        "model_name": azure_name,
+        "sections": [],
+    }
 
-    # # file_path_abs=r"C:\Users\mihir.vasoya\OneDrive - Thermo Fisher Scientific\Desktop\Git-Integration\RegulatoryDocGen\generated output file\PMF_German_9_7_25.docx"
-    # convert_word_to_pdf(file_path_abs,new_file_path_pdf)
-    
-    
+    template_content = extract_text_from_word(template_file_path)
+    part1, part2 = Template_to_list(template_content)
+    template_json = convert_dict(part1)
 
-    # res=assemble_appendices(base_folder, new_file_path_pdf, final_document)
-    # print(res)
+    first_doc, doc_1, new_file_name, new_file_name_pdf = _load_template_docs(site_name, timestamp)
 
+    base_folder = _resolve_base_folder()
+    convert_all_doc_to_docx_in_folder(base_folder)
+    retriever = DocumentRetriever(base_folder)
+    retriever.process_documents()
 
+    st.write("Extracting text from documents...")
+    pipeline_start = time.perf_counter()
 
+    data_as_string = ""
+    if st.session_state.uploaded_excel is not None:
+        data_as_string = extract_text_from_xlsx(st.session_state.uploaded_excel)
+        st.write(data_as_string)
 
+    # TEST MODE: limit to first 5 sections for fast iteration — remove for full runs
+    template_json = dict(list(template_json.items())[:5])
 
+    for key, value in template_json.items():
+        record = _process_one_section(
+            llm, client, key, value, doc_1, retriever, data_as_string, base_folder, ""
+        )
+        run_artifacts["sections"].append(record)
 
+    run_artifacts["timing"] = _compute_pipeline_timing(run_artifacts, pipeline_start)
 
+    output_dir = os.path.join("data", "artifacts", "generated output file")
+    os.makedirs(output_dir, exist_ok=True)
 
+    output, doc_path, final_document = _assemble_document(
+        doc_1, first_doc, output_dir, new_file_name, new_file_name_pdf
+    )
+    run_artifacts["final_doc_path"] = doc_path
 
-    # final_document=os.path.abspath(final_document) 
-   
+    _run_rule_evaluation(run_artifacts)
+    _run_extended_eval_suite(run_artifacts, azure_name, azure_key, azure_endpoint, azure_version)
 
-    # output=None
-    return output,final_document,new_file_name_pdf
-
-    
-
-
+    return output, final_document, new_file_name_pdf
