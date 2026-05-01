@@ -138,9 +138,20 @@ def _run_extended_evaluation(run_artifacts, eval_suite):
         retrieved_chunks = []
         for p in section.get("retrieved_paths", []):
             try:
-                with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                    chunk = f.read()[:4000]
-                    retrieved_chunks.append(chunk)
+                p_lower = str(p).lower()
+                if p_lower.endswith(".pdf"):
+                    import fitz
+                    doc_fitz = fitz.open(p)
+                    text = "".join(page.get_text() for page in doc_fitz)[:4000]
+                elif p_lower.endswith(".docx"):
+                    import docx as _docx_mod
+                    d = _docx_mod.Document(p)
+                    text = "\n".join(para.text for para in d.paragraphs)[:4000]
+                else:
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        text = f.read()[:4000]
+                if text.strip():
+                    retrieved_chunks.append(text)
             except Exception:
                 pass
 

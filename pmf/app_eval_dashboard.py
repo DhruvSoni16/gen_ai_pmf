@@ -283,9 +283,8 @@ def _render_sidebar() -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _render_tab_overview(runs: List[Dict[str, Any]]) -> None:
-    """Metric cards, grade badge, run selector."""
+    """Metric cards and grade for the current (latest) run."""
 
-    # ── Run selector ─────────────────────────────────────────────────────
     if not runs:
         st.info(
             "No evaluation runs found yet. "
@@ -293,178 +292,26 @@ def _render_tab_overview(runs: List[Dict[str, Any]]) -> None:
         )
         return
 
-    # Auto-select the latest run (index 0 — list is sorted newest first)
-    labels = [
-        f"{r.get('timestamp', '')}  |  {r.get('site_name', '')}  |  "
-        f"score={r.get('overall_score', '?')}"
-        for r in runs
-    ]
-    idx = st.selectbox(
-        "Evaluation run",
-        range(len(runs)),
-        format_func=lambda i: labels[i],
-        key="tab1_run_sel",
-        help="Auto-selected: most recent run. Change to compare older runs.",
-    )
-    run_meta = runs[idx]
+    # Always use the latest run — no selector
+    run_meta = runs[0]
     run_file = run_meta.get("run_file", "")
     if not run_file or not os.path.exists(run_file):
         st.warning("Run file not found.")
         return
 
     payload = _load_run_payload(run_file)
-    st.session_state["_current_payload"] = payload  # for sidebar export
+    st.session_state["_current_payload"] = payload
 
     eval_data = payload.get("evaluation", {}).get("document_scores", {})
     ext = _extract_extended(payload)
 
-    # Delta computation (vs previous run)
-    prev_eval: Dict[str, Any] = {}
-    if idx + 1 < len(runs):
-        prev_file = runs[idx + 1].get("run_file", "")
-        if prev_file and os.path.exists(prev_file):
-            prev_payload = _load_run_payload(prev_file)
-            prev_eval = prev_payload.get("evaluation", {}).get("document_scores", {})
-
-    def _delta(cur: Any, prev: Any) -> Optional[float]:
-        try:
-            c, p = float(cur), float(prev)
-            return round(c - p, 2)
-        except (ValueError, TypeError):
-            return None
-
     rule_score = eval_data.get("overall_score", 0)
-    prev_rule = prev_eval.get("overall_score")
-
-    bert_f1 = ext.get("mean_bertscore_f1")
     judge_score = ext.get("mean_judge_normalized")
     rag_triad = ext.get("mean_rag_triad_score") or ext.get("mean_ragas")
     mean_faith = ext.get("mean_faithfulness")
     composite = ext.get("mean_composite", rule_score)
 
-    # ── Smart health summary (plain-English) ─────────────────────────────
-    _grade_val = _letter_grade(float(composite or rule_score or 0))
-    _passed = float(composite or rule_score or 0) >= 65.0
-    _site = run_meta.get("site_name", "")
-    _sec_count = eval_data.get("section_count", 0)
-    _missing = eval_data.get("missing_required_sections", [])
-    _retrieval = eval_data.get("retrieval_coverage", 100)
-    _sections = eval_data.get("sections", [])
-    _worst = sorted(_sections, key=lambda s: s.get("score", 100))[:3]
-
-    # Colour band
-    _health_clr = CLR_SUCCESS if _passed else CLR_DANGER
-    _health_label = "Good Quality" if _grade_val in ("A", "B") else (
-        "Acceptable" if _grade_val == "C" else "Needs Improvement"
-    )
-    st.markdown(
-        f'<div style="background:{_health_clr}22;border-left:4px solid {_health_clr};'
-        f'padding:12px 16px;border-radius:6px;margin-bottom:16px;">'
-        f'<span style="font-size:1.1rem;font-weight:700;color:{_health_clr};">'
-        f'{_grade_badge_html(_grade_val)} &nbsp; {_health_label}</span><br>'
-        f'<span style="color:#374151;">'
-        f'Document for <strong>{_site or "unknown site"}</strong> — '
-        f'{_sec_count} sections evaluated, '
-        f'{_retrieval:.0f}% retrieval coverage'
-        + (f', <strong style="color:{CLR_DANGER};">{len(_missing)} missing required sections</strong>' if _missing else '')
-        + f'</span></div>',
-        unsafe_allow_html=True,
-    )
-
-    if _worst:
-        _low_names = [s.get("section_key", "?")[:40] for s in _worst if s.get("score", 100) < 75]
-        if _low_names:
-            st.warning(
-                f"Sections needing attention: **{', '.join(_low_names)}** — "
-                "see Section Heatmap tab for details."
-            )
-
-    # ── Metric cards ─────────────────────────────────────────────────────
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric(
-        "Rule Score", _fmt(rule_score),
-        delta=_fmt(_delta(rule_score, prev_rule)),
-        help="Structural checks: min length, required sections, keyword presence",
-    )
-    c2.metric(
-        "Judge Score",
-        _fmt(judge_score) if judge_score is not None else "—",
-        help="LLM-as-Judge: regulatory quality scored on 5 criteria (factual accuracy, regulatory language, site specificity, completeness, coherence)",
-    )
-    c3.metric(
-        "Faithfulness",
-        _fmt(mean_faith, 3) if mean_faith is not None else "—",
-        help="DeepEval: fraction of generated claims grounded in source documents (0–1). Low = hallucination.",
-    )
-    c4.metric(
-        "RAG Triad",
-        _fmt(rag_triad, 3) if rag_triad is not None else "—",
-        help="DeepEval RAG Triad: harmonic mean of Faithfulness + Contextual Precision + Answer Relevancy (0–1)",
-    )
-    c5.metric("Composite", _fmt(composite))
-
-    # ── Opik-style metric row ────────────────────────────────────────────
-    _hallucination = ext.get("mean_hallucination_score")
-    _answer_rel = ext.get("mean_answer_relevance_score")
-    _reg_tone = ext.get("mean_regulatory_tone_score")
-    _opik_composite = ext.get("mean_opik_composite")
-
-    _has_opik = any(v is not None for v in [_hallucination, _answer_rel, _reg_tone])
-    if _has_opik:
-        st.markdown(
-            '<p style="font-size:0.78rem;color:#6b7280;margin:12px 0 4px 0;font-weight:600;">'
-            'OPIK-STYLE METRICS (direct continuous scoring)</p>',
-            unsafe_allow_html=True,
-        )
-        oc1, oc2, oc3, oc4 = st.columns(4)
-        _hall_disp = f"{(1.0 - _hallucination):.3f}" if _hallucination is not None else "—"
-        oc1.metric(
-            "Groundedness",
-            _hall_disp,
-            help="Opik: 1 − Hallucination Score. 1.0 = fully grounded, 0 = complete hallucination. "
-                 "Only invented factual claims (names, numbers, certifications) are penalised — "
-                 "regulatory boilerplate is NOT penalised.",
-        )
-        oc2.metric(
-            "Answer Relevance",
-            _fmt(_answer_rel, 3) if _answer_rel is not None else "—",
-            help="Opik: Direct continuous score (0–1) for how well the output addresses the "
-                 "section instruction. Faster and more holistic than DeepEval's reverse-question method.",
-        )
-        oc3.metric(
-            "Regulatory Tone",
-            _fmt(_reg_tone, 3) if _reg_tone is not None else "—",
-            help="PMF-specific metric (not in vanilla Opik): scores language appropriateness for "
-                 "EU GMP Annex 4 / ICH Q10 regulatory submission (0 = informal, 1 = exemplary).",
-        )
-        oc4.metric(
-            "Opik Composite",
-            _fmt(_opik_composite, 3) if _opik_composite is not None else "—",
-            help="Mean of Groundedness + Answer Relevance + Regulatory Tone.",
-        )
-
-    # ── MLflow tracking link ─────────────────────────────────────────────
-    _run_arts = payload.get("run_artifacts", payload)
-    _mlflow_run_id = _run_arts.get("mlflow_run_id")
-    _mlflow_url = _run_arts.get("mlflow_ui_url", "http://localhost:5000")
-    if _mlflow_run_id:
-        st.markdown(
-            f'<div style="margin:8px 0 4px 0;">'
-            f'<a href="{_mlflow_url}" target="_blank" style="font-size:0.85rem;color:#5340C0;">'
-            f'🔗 Open in MLflow UI &nbsp;<span style="color:#9ca3af;font-size:0.75rem;">'
-            f'(run: {_mlflow_run_id[:8]}…)</span></a>'
-            f'&nbsp;&nbsp;<span style="color:#6b7280;font-size:0.78rem;">'
-            f'Run <code>mlflow ui</code> in the project folder to start the server.</span>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.caption(
-            "MLflow tracking: run `mlflow ui` in the project folder → "
-            "open http://localhost:5000 to compare runs over time."
-        )
-
-    # ── Metric tooltips ─────────────────────────────────────────────────
+    # ── 1. What do these metrics mean? (at the very top) ─────────────────
     with st.expander("What do these metrics mean?"):
         st.markdown(
             "**Rule Score** — Structural quality checks: minimum character length, "
@@ -483,56 +330,86 @@ def _render_tab_overview(runs: List[Dict[str, Any]]) -> None:
             "Answer Relevancy (0–1 scale). Industry-standard composite for RAG quality.\n\n"
             "**Composite** — Weighted blend: Rule 20% + Judge 55% + RAG Triad 25%.\n\n"
             "---\n\n"
-            "**Groundedness** *(Opik-style)* — 1 minus the hallucination score. Single LLM "
-            "call asking for a direct continuous score. Only penalises invented factual claims "
-            "(names, numbers, certifications) — NOT regulatory boilerplate.\n\n"
-            "**Answer Relevance** *(Opik-style)* — How well the output addresses the section "
-            "instruction, scored as a direct continuous value (0–1). One LLM call per section.\n\n"
-            "**Regulatory Tone** *(PMF-specific, not in vanilla Opik)* — Language quality for "
-            "EU GMP Annex 4 / ICH Q10 regulatory submission. 1 = exemplary formal regulatory "
-            "language, 0 = completely inappropriate.\n\n"
-            "**Opik Composite** — Mean of Groundedness + Answer Relevance + Regulatory Tone.\n\n"
-            "*DeepEval vs Opik*: DeepEval extracts discrete claims and checks each one (binary, "
-            "multi-call). Opik asks the LLM for one direct continuous score per section (faster, "
-            "captures nuance). Both frameworks complement each other."
+            "**Groundedness** *(Opik-style)* — 1 minus the hallucination score. Only "
+            "penalises invented factual claims (names, numbers, certifications).\n\n"
+            "**Answer Relevance** *(Opik-style)* — How well the output addresses the "
+            "section instruction. One LLM call per section (0–1).\n\n"
+            "**Regulatory Tone** *(PMF-specific)* — Language quality for EU GMP Annex 4 "
+            "/ ICH Q10 regulatory submission. 1 = exemplary, 0 = inappropriate.\n\n"
+            "**Opik Composite** — Mean of Groundedness + Answer Relevance + Regulatory Tone."
         )
 
-    # ── Grade badge ──────────────────────────────────────────────────────
-    grade = ext.get("overall_grade") or _letter_grade(float(composite or rule_score or 0))
-    passed = float(composite or rule_score or 0) >= 65.0
-    badge_html = _grade_badge_html(grade)
-    status = "PASS" if passed else "FAIL"
-    status_clr = CLR_SUCCESS if passed else CLR_DANGER
-    _framework_label = ""
-    _fw = ext.get("framework", "")
-    if "opik_style" in _fw:
-        _framework_label = ' &nbsp;<span style="font-size:0.75rem;color:#6b7280;font-weight:400;">DeepEval + Opik-style</span>'
-    elif "deepeval" in _fw or ext.get("mean_rag_triad_score") is not None:
-        _framework_label = ' &nbsp;<span style="font-size:0.75rem;color:#6b7280;font-weight:400;">DeepEval RAG Triad</span>'
+    # ── 2. Grade + one-sentence overview ─────────────────────────────────
+    _grade_val = _letter_grade(float(composite or rule_score or 0))
+    _passed = float(composite or rule_score or 0) >= 65.0
+    _site = run_meta.get("site_name", "")
+    _health_clr = CLR_SUCCESS if _passed else CLR_DANGER
+    _health_label = "Good Quality" if _grade_val in ("A", "B") else (
+        "Acceptable" if _grade_val == "C" else "Needs Improvement"
+    )
     st.markdown(
-        f"{badge_html} &nbsp; "
-        f'<span style="color:{status_clr};font-weight:700;">{status}</span>'
-        f"{_framework_label}",
+        f'<div style="background:{_health_clr}22;border-left:4px solid {_health_clr};'
+        f'padding:12px 16px;border-radius:6px;margin:12px 0 16px 0;">'
+        f'<span style="font-size:1.1rem;font-weight:700;color:{_health_clr};">'
+        f'{_grade_badge_html(_grade_val)} &nbsp; {_health_label}</span><br>'
+        f'<span style="color:#374151;">'
+        f'Document for <strong>{_site or "unknown site"}</strong> — '
+        f'composite score {float(composite or rule_score or 0):.1f}/100.'
+        f'</span></div>',
         unsafe_allow_html=True,
     )
 
-    # ── Section count, retrieval, missing sections ───────────────────────
-    mc1, mc2, mc3 = st.columns(3)
-    mc1.metric("Section Count", eval_data.get("section_count", 0))
-    mc2.metric("Retrieval Coverage",
-               f"{eval_data.get('retrieval_coverage', 0)}%")
-    missing = eval_data.get("missing_required_sections", [])
-    if missing:
-        mc3.error(f"Missing: {', '.join(missing)}")
-    else:
-        mc3.success("All required sections present")
+    # ── 3. Metric cards ───────────────────────────────────────────────────
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Rule Score", _fmt(rule_score),
+              help="Structural checks: min length, required sections, keyword presence")
+    c2.metric("Judge Score", _fmt(judge_score) if judge_score is not None else "—",
+              help="LLM-as-Judge: 5-criterion rubric (factual accuracy, regulatory language, "
+                   "site specificity, completeness, coherence). Score: 0–100.")
+    c3.metric("Faithfulness", _fmt(mean_faith, 3) if mean_faith is not None else "—",
+              help="DeepEval: fraction of generated claims grounded in source documents (0–1).")
+    c4.metric("RAG Triad", _fmt(rag_triad, 3) if rag_triad is not None else "—",
+              help="Harmonic mean of Faithfulness + Contextual Precision + Answer Relevancy (0–1).")
+    c5.metric("Composite", _fmt(composite))
 
-    # ── Download Report (DOCX) ───────────────────────────────────────────
-    _render_download_report(payload, eval_data, ext, grade, rule_score)
+    # ── 4. Opik-style metric row ──────────────────────────────────────────
+    _hallucination = ext.get("mean_hallucination_score")
+    _answer_rel = ext.get("mean_answer_relevance_score")
+    _reg_tone = ext.get("mean_regulatory_tone_score")
+    _opik_composite = ext.get("mean_opik_composite")
 
-    # ── Live Evaluation mode ─────────────────────────────────────────────
-    st.divider()
-    _render_live_evaluation()
+    if any(v is not None for v in [_hallucination, _answer_rel, _reg_tone]):
+        st.markdown(
+            '<p style="font-size:0.78rem;color:#6b7280;margin:12px 0 4px 0;font-weight:600;">'
+            'OPIK-STYLE METRICS</p>',
+            unsafe_allow_html=True,
+        )
+        oc1, oc2, oc3, oc4 = st.columns(4)
+        oc1.metric("Groundedness",
+                   f"{(1.0 - _hallucination):.3f}" if _hallucination is not None else "—",
+                   help="1 − Hallucination Score.")
+        oc2.metric("Answer Relevance",
+                   _fmt(_answer_rel, 3) if _answer_rel is not None else "—",
+                   help="How well the output addresses the section instruction (0–1).")
+        oc3.metric("Regulatory Tone",
+                   _fmt(_reg_tone, 3) if _reg_tone is not None else "—",
+                   help="GMP/ICH Q10 language quality (0–1).")
+        oc4.metric("Opik Composite",
+                   _fmt(_opik_composite, 3) if _opik_composite is not None else "—",
+                   help="Mean of Groundedness + Answer Relevance + Regulatory Tone.")
+
+    # ── 5. MLflow link ────────────────────────────────────────────────────
+    _run_arts = payload.get("run_artifacts", payload)
+    _mlflow_run_id = _run_arts.get("mlflow_run_id")
+    _mlflow_url = _run_arts.get("mlflow_ui_url", "http://localhost:5000")
+    if _mlflow_run_id:
+        st.markdown(
+            f'<div style="margin:8px 0 4px 0;">'
+            f'<a href="{_mlflow_url}" target="_blank" style="font-size:0.85rem;color:#5340C0;">'
+            f'🔗 Open in MLflow UI &nbsp;<span style="color:#9ca3af;font-size:0.75rem;">'
+            f'(run: {_mlflow_run_id[:8]}…)</span></a></div>',
+            unsafe_allow_html=True,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1005,14 +882,8 @@ def _render_tab_heatmap(runs: List[Dict[str, Any]]) -> None:
         st.info("No runs available.")
         return
 
-    # Reuse the same run selector
-    labels = [
-        f"{r.get('timestamp', '')}  |  {r.get('site_name', '')}"
-        for r in runs
-    ]
-    idx = st.selectbox("Select run for heatmap", range(len(runs)),
-                       format_func=lambda i: labels[i], key="tab2_run_sel")
-    run_file = runs[idx].get("run_file", "")
+    # Always use the latest run — no selector
+    run_file = runs[0].get("run_file", "")
     if not run_file or not os.path.exists(run_file):
         return
 
@@ -1482,40 +1353,26 @@ def _render_tab_benchmark() -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _render_tab_performance(runs: List[Dict[str, Any]]) -> None:
-    """Latency breakdown, failure analysis, and improvement recommendations."""
+    """Latency breakdown and issues for the current run."""
 
     if not runs:
         st.info("No runs available. Generate a PMF document first.")
         return
 
-    # ── Run selector ──────────────────────────────────────────────────
-    labels = [
-        f"{r.get('timestamp', '')}  |  {r.get('site_name', '')}  |  score={r.get('overall_score', '?')}"
-        for r in runs
-    ]
-    idx = st.selectbox("Run", range(len(runs)), format_func=lambda i: labels[i],
-                       key="perf_run_sel")
-    run_meta = runs[idx]
-    payload = _load_run_payload(run_meta.get("run_file", ""))
+    # Always use the latest run — no selector
+    payload = _load_run_payload(runs[0].get("run_file", ""))
     run_arts = payload.get("run_artifacts", payload)
     perf = run_arts.get("performance_report", {})
-
-    # ── View toggle: Plain English / Technical ─────────────────────────
-    view = st.radio("View mode", ["Plain English", "Technical"], horizontal=True,
-                    key="perf_view_mode",
-                    help="Plain English: for non-technical stakeholders. Technical: for engineers.")
-    is_tech = view == "Technical"
 
     st.divider()
 
     # ── Summary banner ────────────────────────────────────────────────
-    summary = perf.get("summary_technical" if is_tech else "summary_plain", "")
-    if summary:
-        st.info(summary)
-    else:
+    summary = perf.get("summary_plain", "") or perf.get("summary_technical", "")
+    if not summary:
         st.info("No performance data available for this run. Performance tracking is captured from the next document generation onwards.")
-        _render_performance_legend()
         return
+
+    st.info(summary)
 
     # ── Overall timing cards ──────────────────────────────────────────
     ot = perf.get("overall_timing", {})
@@ -1527,16 +1384,11 @@ def _render_tab_performance(runs: List[Dict[str, Any]]) -> None:
 
     st.subheader("Overall Timing")
     tc1, tc2, tc3, tc4, tc5 = st.columns(5)
-    tc1.metric("Total Time",       f"{total_s:.1f}s" if total_s else "—",
-               help="End-to-end pipeline: retrieval + generation + evaluation")
-    tc2.metric("LLM Generation",   f"{gen_s:.1f}s"   if gen_s  else "—",
-               help="Cumulative time spent calling the LLM across all sections")
-    tc3.metric("Retrieval",        f"{ret_s:.1f}s"   if ret_s  else "—",
-               help="Cumulative time spent querying the vector database")
-    tc4.metric("Evaluation",       f"{eval_s:.1f}s"  if eval_s else "—",
-               help="Cumulative time running DeepEval + Opik metrics")
-    tc5.metric("Avg / Section",    f"{avg_s:.1f}s"   if avg_s  else "—",
-               help="Average time per section (total ÷ section count)")
+    tc1.metric("Total Time",     f"{total_s:.1f}s" if total_s else "—")
+    tc2.metric("LLM Generation", f"{gen_s:.1f}s"   if gen_s  else "—")
+    tc3.metric("Retrieval",      f"{ret_s:.1f}s"   if ret_s  else "—")
+    tc4.metric("Evaluation",     f"{eval_s:.1f}s"  if eval_s else "—")
+    tc5.metric("Avg / Section",  f"{avg_s:.1f}s"   if avg_s  else "—")
 
     # ── Time breakdown donut chart ────────────────────────────────────
     if HAS_PLOTLY and gen_s + ret_s + eval_s > 0:
@@ -1550,40 +1402,31 @@ def _render_tab_performance(runs: List[Dict[str, Any]]) -> None:
             hovertemplate="%{label}: %{value:.1f}s (%{percent})<extra></extra>",
         ))
         fig_donut.update_layout(
-            margin=dict(t=30, b=10, l=10, r=10),
-            height=260,
-            showlegend=False,
-            title_text="Time Breakdown",
-            title_x=0.5,
+            margin=dict(t=30, b=10, l=10, r=10), height=260,
+            showlegend=False, title_text="Time Breakdown", title_x=0.5,
         )
         st.plotly_chart(fig_donut, use_container_width=True)
 
     st.divider()
 
-    # ── Per-section latency bar chart ─────────────────────────────────
+    # ── Per-section latency bar chart (total time only) ───────────────
     st.subheader("Section Latency")
     section_timings = perf.get("section_timings", [])
     if section_timings:
         df_timing = pd.DataFrame([
             {
-                "Section": t["section_key"][:45],
+                "Section":        t["section_key"][:45],
                 "Retrieval (s)":  round((t.get("retrieval_ms") or 0) / 1000, 2),
                 "Generation (s)": round((t.get("generation_ms") or 0) / 1000, 2),
                 "Evaluation (s)": round((t.get("eval_ms") or 0) / 1000, 2),
                 "Total (s)":      round((t.get("total_ms") or 0) / 1000, 2),
-                "Static":         t.get("is_static", False),
             }
             for t in section_timings
-        ])
-        # Sort slowest first
-        df_timing = df_timing.sort_values("Total (s)", ascending=False)
+        ]).sort_values("Total (s)", ascending=False)
 
         if HAS_PLOTLY:
             fig_bar = px.bar(
-                df_timing,
-                x="Total (s)",
-                y="Section",
-                orientation="h",
+                df_timing, x="Total (s)", y="Section", orientation="h",
                 color="Total (s)",
                 color_continuous_scale=["#1D9E75", "#BA7517", "#D85A30"],
                 labels={"Total (s)": "Time (seconds)", "Section": ""},
@@ -1593,28 +1436,8 @@ def _render_tab_performance(runs: List[Dict[str, Any]]) -> None:
             fig_bar.update_coloraxes(showscale=False)
             fig_bar.update_layout(margin=dict(t=40, b=20, l=10, r=20), yaxis_autorange="reversed")
             st.plotly_chart(fig_bar, use_container_width=True)
-
-            # Stacked breakdown chart
-            df_stack = df_timing[["Section", "Retrieval (s)", "Generation (s)", "Evaluation (s)"]].copy()
-            fig_stack = px.bar(
-                df_stack.melt(id_vars="Section", var_name="Phase", value_name="Time (s)"),
-                x="Time (s)",
-                y="Section",
-                color="Phase",
-                orientation="h",
-                color_discrete_map={
-                    "Retrieval (s)":  "#1D9E75",
-                    "Generation (s)": "#5340C0",
-                    "Evaluation (s)": "#BA7517",
-                },
-                title="Phase Breakdown per Section",
-                height=max(300, len(df_timing) * 28),
-            )
-            fig_stack.update_layout(margin=dict(t=40, b=20, l=10, r=20), yaxis_autorange="reversed",
-                                    legend_title_text="Phase")
-            st.plotly_chart(fig_stack, use_container_width=True)
         else:
-            st.dataframe(df_timing[["Section", "Retrieval (s)", "Generation (s)", "Evaluation (s)", "Total (s)"]],
+            st.dataframe(df_timing[["Section", "Retrieval (s)", "Generation (s)", "Total (s)"]],
                          use_container_width=True, hide_index=True)
 
         slowest = ot.get("slowest_section")
@@ -1625,69 +1448,31 @@ def _render_tab_performance(runs: List[Dict[str, Any]]) -> None:
 
     st.divider()
 
-    # ── Failures table ────────────────────────────────────────────────
+    # ── Issues detected ───────────────────────────────────────────────
     st.subheader("Issues Detected")
     failures = perf.get("failures", [])
-
     if failures:
-        SEVERITY_ICON = {"critical": "🔴", "warning": "🟡", "info": "🔵"}
+        SEVERITY_ICON  = {"critical": "🔴", "warning": "🟡", "info": "🔵"}
         SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
-
         df_fail = pd.DataFrame([
             {
-                "Severity":  SEVERITY_ICON.get(f["severity"], "") + " " + f["severity"].upper(),
-                "Section":   f["section_key"][:45],
-                "Type":      f["failure_type"].replace("_", " ").title(),
-                "Details":   f["plain_english"] if not is_tech else f["technical"],
-                "Metric":    f"{f['metric_value']:.3f}" if f.get("metric_value") is not None else "—",
-                "_sev_ord":  SEVERITY_ORDER.get(f["severity"], 9),
+                "Severity": SEVERITY_ICON.get(f["severity"], "") + " " + f["severity"].upper(),
+                "Section":  f["section_key"][:45],
+                "Type":     f["failure_type"].replace("_", " ").title(),
+                "Details":  f.get("plain_english", ""),
+                "Metric":   f"{f['metric_value']:.3f}" if f.get("metric_value") is not None else "—",
+                "_ord":     SEVERITY_ORDER.get(f["severity"], 9),
             }
             for f in failures
-        ])
-        df_fail = df_fail.sort_values("_sev_ord").drop(columns=["_sev_ord"])
-
+        ]).sort_values("_ord").drop(columns=["_ord"])
         st.dataframe(df_fail, use_container_width=True, hide_index=True,
-                     column_config={
-                         "Details": st.column_config.TextColumn("Details", width="large"),
-                     })
-
+                     column_config={"Details": st.column_config.TextColumn("Details", width="large")})
         n_crit = sum(1 for f in failures if f["severity"] == "critical")
         n_warn = sum(1 for f in failures if f["severity"] == "warning")
         n_info = sum(1 for f in failures if f["severity"] == "info")
         st.caption(f"🔴 {n_crit} critical &nbsp; 🟡 {n_warn} warnings &nbsp; 🔵 {n_info} informational")
     else:
         st.success("No issues detected. All sections generated and evaluated successfully.")
-
-    st.divider()
-
-    # ── Improvement recommendations ───────────────────────────────────
-    st.subheader("Improvement Recommendations")
-    improvements = perf.get("improvements", [])
-
-    if improvements:
-        PRIORITY_ICON = {"high": "🔥", "medium": "📌", "low": "💡"}
-        PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
-        improvements_sorted = sorted(improvements, key=lambda x: PRIORITY_ORDER.get(x.get("priority", "low"), 9))
-
-        for imp in improvements_sorted:
-            priority = imp.get("priority", "low")
-            area = imp.get("area", "General")
-            icon = PRIORITY_ICON.get(priority, "💡")
-            desc = imp["technical"] if is_tech else imp["plain_english"]
-            affected = imp.get("affected_sections", [])
-
-            with st.expander(f"{icon} **{area}** — {priority.upper()} priority", expanded=(priority == "high")):
-                st.markdown(desc)
-                if affected:
-                    st.caption(
-                        "Affected sections: "
-                        + ", ".join(f"`{s[:40]}`" for s in affected[:6])
-                        + (" …" if len(affected) > 6 else "")
-                    )
-    else:
-        st.success("No improvements identified — the pipeline is running optimally.")
-
-    _render_performance_legend()
 
 
 def _render_performance_legend() -> None:
@@ -1710,11 +1495,176 @@ def _render_performance_legend() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# RAG EVALUATION TAB
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _render_tab_rag_evaluation(runs: List[Dict[str, Any]]) -> None:
+    """RAG Evaluation: retrieved chunk relevance per section."""
+
+    if not runs:
+        st.info("No evaluation runs found yet. Generate a PMF document first.")
+        return
+
+    run_file = runs[0].get("run_file", "")
+    if not run_file or not os.path.exists(run_file):
+        st.warning("Run file not found.")
+        return
+
+    payload = _load_run_payload(run_file)
+    run_arts = payload.get("run_artifacts", payload)
+    sections = run_arts.get("sections", [])
+
+    if not sections:
+        st.info("No section data available. Generate a PMF document first.")
+        return
+
+    site_name = run_arts.get("site_name", "")
+    timestamp = run_arts.get("timestamp", "")
+
+    st.subheader("RAG Evaluation — Retrieved Chunk Relevance")
+    st.caption(
+        f"Run: **{timestamp}** | Site: **{site_name or '—'}**  "
+        "Measures how relevant the retrieved document chunks are for each section's query."
+    )
+
+    with st.expander("What do these RAG metrics mean?"):
+        st.markdown(
+            "**Faithfulness** — Checks that every factual claim in the generated text is "
+            "grounded in the retrieved context. Score = supported claims / total claims. "
+            "Low score means the model hallucinated facts not present in source documents.\n\n"
+            "**Contextual Precision** — Measures whether the most relevant retrieved chunks "
+            "are ranked at the top. Uses rank-weighted Average Precision. Low score means "
+            "irrelevant chunks were retrieved ahead of useful ones.\n\n"
+            "**Answer Relevancy** — Reverse-generates questions from the output and checks "
+            "how well they match the original section instruction. Low score means the "
+            "generated text answers a different question than was asked.\n\n"
+            "**RAG Triad Score** — Harmonic mean of all three metrics. Any single weak "
+            "metric drags the triad down significantly. Industry-standard composite (0–1)."
+        )
+
+    # ── Build summary table ───────────────────────────────────────────────
+    rows = []
+    for sec in sections:
+        key = sec.get("section_key", "?")
+        is_static = sec.get("is_static", False)
+        retrieved_paths = sec.get("retrieved_paths", [])
+        rag = (sec.get("extended_eval") or {}).get("rag_scores") or {}
+
+        rows.append({
+            "Section": key[:40],
+            "Static": "Yes" if is_static else "No",
+            "Retrieved Docs": len(retrieved_paths),
+            "Faithfulness": _safe_pct(rag.get("faithfulness")),
+            "Ctx Precision": _safe_pct(rag.get("contextual_precision") or rag.get("context_precision")),
+            "Ans Relevancy": _safe_pct(rag.get("answer_relevancy")),
+            "RAG Triad": _safe_pct(rag.get("rag_triad_score") or rag.get("ragas_score")),
+        })
+
+    df = pd.DataFrame(rows)
+    rag_metric_cols = ["Faithfulness", "Ctx Precision", "Ans Relevancy", "RAG Triad"]
+    has_rag_data = df[rag_metric_cols].notna().any().any()
+
+    if has_rag_data:
+        styled = df.set_index("Section").style.background_gradient(
+            cmap="RdYlGn", vmin=0, vmax=100, subset=rag_metric_cols, axis=None,
+        ).format("{:.1f}", subset=rag_metric_cols, na_rep="—")
+        st.dataframe(styled, use_container_width=True, height=min(len(df) * 40 + 60, 500))
+    else:
+        st.dataframe(df, use_container_width=True)
+        st.info(
+            "RAG metric scores are not yet computed for this run. "
+            "Extended evaluation (DeepEval) must be enabled and a run completed to populate these scores."
+        )
+
+    # ── Aggregate summary ─────────────────────────────────────────────────
+    if has_rag_data:
+        st.subheader("Aggregate RAG Metrics")
+        agg_cols = st.columns(4)
+        for i, col_name in enumerate(rag_metric_cols):
+            col_vals = df[col_name].dropna()
+            agg_cols[i].metric(
+                f"Mean {col_name}",
+                f"{col_vals.mean():.1f}" if not col_vals.empty else "—",
+            )
+
+        if HAS_PLOTLY:
+            triad_df = df[["Section", "RAG Triad"]].dropna(subset=["RAG Triad"]).sort_values("RAG Triad", ascending=False)
+            if not triad_df.empty:
+                fig = px.bar(
+                    triad_df, x="RAG Triad", y="Section", orientation="h",
+                    color="RAG Triad",
+                    color_continuous_scale=["#D85A30", "#BA7517", "#1D9E75"],
+                    range_color=[0, 100],
+                    labels={"RAG Triad": "RAG Triad Score (0–100)", "Section": ""},
+                    title="RAG Triad Score per Section",
+                    height=max(300, len(triad_df) * 30),
+                )
+                fig.update_coloraxes(showscale=False)
+                fig.update_layout(
+                    margin=dict(t=40, b=20, l=10, r=20),
+                    yaxis_autorange="reversed",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+    # ── Per-section detail ────────────────────────────────────────────────
+    st.subheader("Section Detail")
+    sec_keys = [s.get("section_key", "?") for s in sections]
+    sel = st.selectbox("Select section", sec_keys, key="rag_tab_sec_detail")
+    sec_data = next((s for s in sections if s.get("section_key") == sel), {})
+    rag = (sec_data.get("extended_eval") or {}).get("rag_scores") or {}
+
+    dc1, dc2 = st.columns(2)
+    with dc1:
+        st.markdown("**Retrieval Query**")
+        q = sec_data.get("retrieval_query", "")
+        st.text(q if q else "— (no retrieval query recorded)")
+
+        st.markdown("**Retrieved Documents**")
+        paths = sec_data.get("retrieved_paths", [])
+        if paths:
+            for p in paths:
+                st.markdown(f"- `{os.path.basename(str(p))}`")
+        else:
+            st.write("No retrieved paths recorded.")
+
+    with dc2:
+        st.markdown("**RAG Scores**")
+        faith = rag.get("faithfulness")
+        ctx_p = rag.get("contextual_precision") or rag.get("context_precision")
+        ans_r = rag.get("answer_relevancy")
+        triad = rag.get("rag_triad_score") or rag.get("ragas_score")
+
+        ms1, ms2 = st.columns(2)
+        ms1.metric("Faithfulness", f"{float(faith):.3f}" if faith is not None else "—")
+        ms2.metric("Ctx Precision", f"{float(ctx_p):.3f}" if ctx_p is not None else "—")
+        ms3, ms4 = st.columns(2)
+        ms3.metric("Answer Relevancy", f"{float(ans_r):.3f}" if ans_r is not None else "—")
+        ms4.metric("RAG Triad", f"{float(triad):.3f}" if triad is not None else "—")
+
+        claims = rag.get("faithfulness_claims", [])
+        if claims:
+            with st.expander(f"Faithfulness Claims ({len(claims)})"):
+                for c in claims[:10]:
+                    icon = "✓" if c.get("supported") else "✗"
+                    clr = CLR_SUCCESS if c.get("supported") else CLR_DANGER
+                    st.markdown(
+                        f'<span style="color:{clr};">{icon}</span> {c.get("claim", "?")}',
+                        unsafe_allow_html=True,
+                    )
+
+        gen_qs = rag.get("generated_questions", [])
+        if gen_qs:
+            with st.expander(f"Answer Relevancy Questions ({len(gen_qs)})"):
+                for gq in gen_qs:
+                    st.markdown(f"- {gq}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN RENDER
 # ═══════════════════════════════════════════════════════════════════════════
 
 def render_eval_dashboard() -> None:
-    """Render the complete 6-tab evaluation dashboard."""
+    """Render the two-tab evaluation dashboard (RAG Evaluation | LLM Evaluation)."""
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
     st.markdown(
         '<div class="dashboard-header">'
@@ -1728,23 +1678,19 @@ def render_eval_dashboard() -> None:
 
     runs = _load_runs()
 
-    t1, t2, t3, t4, t5, t6 = st.tabs([
-        "Run Overview", "Section Heatmap", "Trend Analysis",
-        "Model Comparison", "Benchmark Management", "⚡ Performance",
-    ])
+    outer1, outer2 = st.tabs(["RAG Evaluation", "LLM Evaluation"])
 
-    with t1:
-        _render_tab_overview(runs)
-    with t2:
-        _render_tab_heatmap(runs)
-    with t3:
-        _render_tab_trends(runs)
-    with t4:
-        _render_tab_model_comparison()
-    with t5:
-        _render_tab_benchmark()
-    with t6:
-        _render_tab_performance(runs)
+    with outer1:
+        _render_tab_rag_evaluation(runs)
+
+    with outer2:
+        t1, t2, t3 = st.tabs(["Run Overview", "Section Heatmap", "⚡ Performance"])
+        with t1:
+            _render_tab_overview(runs)
+        with t2:
+            _render_tab_heatmap(runs)
+        with t3:
+            _render_tab_performance(runs)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,65 @@
+# ── Core App ──────────────────────────────────────────────────────────────
+streamlit>=1.39.0
+python-dotenv>=1.0.0
+
+# ── LLM / Azure OpenAI ────────────────────────────────────────────────────
+openai>=1.50.0
+langchain-openai>=0.3.0
+langchain-community>=0.3.0
+langchain-core>=0.3.0
+langchain-text-splitters>=0.3.0
+tiktoken>=0.8.0
+
+# ── Document Processing ───────────────────────────────────────────────────
+python-docx>=1.1.0
+docxcompose>=1.4.0
+PyMuPDF>=1.24.0
+PyPDF2>=3.0.0
+pdfplumber>=0.11.0
+pdf2image>=1.17.0
+pytesseract>=0.3.13
+Pillow>=10.0.0
+openpyxl>=3.1.0
+fuzzywuzzy>=0.18.0
+python-Levenshtein>=0.26.0
+extract-msg>=0.50.0
+
+# ── Vector DB / Retrieval ─────────────────────────────────────────────────
+faiss-cpu>=1.9.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+
+# ── Data / Visualisation ──────────────────────────────────────────────────
+pandas>=2.0.0
+plotly>=5.18.0
+
+# ── Evaluation Framework ──────────────────────────────────────────────────
+mlflow>=2.10.0
+sacrebleu>=2.3.1
+rouge-score>=0.1.2
+pyyaml>=6.0.0
+
+# ── Web Scraping (optional — scraping modules only) ───────────────────────
+selenium>=4.20.0
+beautifulsoup4>=4.12.0
+webdriver-manager>=4.0.0
+fake-useragent>=1.5.0
+undetected-chromedriver>=3.5.0
+requests>=2.31.0
+
+# ── Windows-only (document conversion) ───────────────────────────────────
+# These install only on Windows. Remove this section on Linux/Mac.
+pywin32>=311
+comtypes>=1.4.0
+docx2pdf>=0.1.8
+
+# ── Optional — requires torch (may fail on Windows due to DLL conflicts) ──
+# Install only if sentence-transformers loads successfully on your machine.
+# The app falls back to TF-IDF automatically if these are unavailable.
+# sentence-transformers>=2.2.0
+# bert-score>=0.3.13
+# anthropic>=0.25.0       # only needed for Claude-as-Judge (Azure OpenAI is used by default)
+
+# ── Testing ───────────────────────────────────────────────────────────────
+pytest>=7.0.0
+pytest-cov>=4.0.0

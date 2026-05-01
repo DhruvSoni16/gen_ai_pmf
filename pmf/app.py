@@ -293,7 +293,7 @@ if st.session_state.selected_feature =='Plant':
 
     st.session_state.SiteName = st.text_input("Enter the site name", value="")
 
-    template_doc = r"templates\PMF_Template_With_vector_DB - Copy.docx"
+    template_doc = r"templates\PMF_Template_With_vector_DB.docx"
         
     
   

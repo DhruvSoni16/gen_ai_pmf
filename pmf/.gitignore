@@ -12,3 +12,6 @@ __pycache__/
 *.pyo
 *.egg-info/
 reports/
+mlruns/
+mlflow.db
+*.db
