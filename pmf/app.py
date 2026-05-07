@@ -155,24 +155,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 image_name=[]
-# Example: Add your logo (local or online image path)
-logo_url = r"static\logo1.png"  
 
-# Add the logo to the sidebar
-st.sidebar.image(logo_url, width=200,caption=None )
-
-# Initialize session state variables if they don't exist
 if 'selected_feature' not in st.session_state:
     st.session_state.selected_feature = None
-    
+
 col1, col2, col3 = st.columns(3)
 
-
-#---------------------------------------Side Bar------------------------------------------------------------------------------
-
-st.sidebar.header("Document Generator Menu")
 with st.sidebar:
-    
     if st.button("Technical File"):
         st.session_state.selected_feature = 'Technical'
 
@@ -303,7 +292,7 @@ if st.session_state.selected_feature =='Plant':
     if st.button("Submit"):
             clear_extracted_folder("data/artifacts/Extracted_folder")
             if uploaded_file is None :
-                st.warning("🚨 Please fill in all required fields and upload files before submitting.")
+                st.warning("Please fill in all required fields and upload files before submitting.")
             
             
             
@@ -360,7 +349,7 @@ if st.session_state.selected_feature =='Plant':
                 prefix = "PMF_Document" 
                
                 if pdf_path: 
-                    st.subheader("📥 The generated file has been saved at the following folder path:")
+                    st.subheader("The generated file has been saved at the following folder path:")
 
                     st.html(f"<p><strong>Response generation time:- </strong>{response_time:.2f} seconds</p>")
                     
@@ -369,7 +358,7 @@ if st.session_state.selected_feature =='Plant':
                     # Generate the Word document download link
                     final_file_name = f"PMF_{timestamp}.docx"
                     if text: 
-                        st.subheader("📥 You can download generated word file here: ")
+                        st.subheader("You can download generated word file here: ")
                     else:  
                         st.write("No text available for download.")
                         st.button("Download", disabled=True)
@@ -398,7 +387,7 @@ if st.session_state.selected_feature =='Plant':
                     if _mlflow_run_id:
                         _mlflow_line = (
                             f'<br><span style="font-size:0.82rem;">'
-                            f'📊 <a href="{_mlflow_url}" target="_blank" style="color:#5340C0;">'
+                            f'<a href="{_mlflow_url}" target="_blank" style="color:#5340C0;">'
                             f'View in MLflow UI</a> &nbsp;'
                             f'<span style="color:#9ca3af;">(run: {_mlflow_run_id[:8]}…)</span>'
                             f'</span>'
